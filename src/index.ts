@@ -5,6 +5,7 @@ import Fastify from "fastify";
 
 import { loadConfig } from "./config.js";
 import { connectDb } from "./db.js";
+import { ensureUnlockEventIndexes } from "./lib/index-migrations.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerBillingRoutes, handleStripeWebhook } from "./routes/billing.js";
@@ -17,6 +18,7 @@ import { seedAdminIfNeeded } from "./seed.js";
 async function main() {
   const cfg = loadConfig();
   await connectDb(cfg.MONGODB_URI);
+  await ensureUnlockEventIndexes();
   await seedAdminIfNeeded(cfg);
 
   const app = Fastify({ logger: true });

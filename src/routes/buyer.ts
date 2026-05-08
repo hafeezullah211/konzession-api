@@ -18,6 +18,7 @@ import {
   SELLER_PROFILE_UNLOCKING_DISABLED_MESSAGE,
 } from "../lib/platform-settings.js";
 import { UnlockEventModel } from "../models/UnlockEvent.js";
+import { formatInquiryAddressLine } from "../lib/inquiry-address.js";
 
 const creditsCheckoutBody = z.object({
   credits: z.number().int().min(1).max(500),
@@ -33,12 +34,92 @@ const objectIdString = z.string().refine((s) => Types.ObjectId.isValid(s), {
   message: "invalid_object_id",
 });
 
-const unlockBody = z.object({
-  sellerId: objectIdString,
-});
+/** Same federal-state set used by the public listings search. */
+const BUYER_DIRECTORY_BUNDESLAND = [
+  "Wien",
+  "Niederösterreich",
+  "Oberösterreich",
+  "Steiermark",
+  "Tirol",
+  "Kärnten",
+  "Salzburg",
+  "Vorarlberg",
+  "Burgenland",
+] as const;
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function firstQueryString(v: unknown): string | undefined {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v) && typeof v[0] === "string") return v[0];
+  return undefined;
+}
+
+/**
+ * Builds the Mongo filter for the buyer-directory teaser list. Mirrors the
+ * landing page's `/public/listings/search` semantics: `state` narrows by
+ * Bundesland, `q` does case-insensitive substring search across the listing's
+ * public-safe fields. Locked teasers still get scrubbed by `listingToTeaser`.
+ */
+function buildDirectoryListingFilter(
+  qs: Record<string, unknown>
+): { filter: Record<string, unknown>; q: string; state: string } {
+  const filter: Record<string, unknown> = { status: "approved", active: true };
+
+  const stateRaw = firstQueryString(qs.state) ?? "all";
+  const state =
+    stateRaw === "all" || (BUYER_DIRECTORY_BUNDESLAND as readonly string[]).includes(stateRaw)
+      ? stateRaw
+      : "all";
+  if (state !== "all") {
+    filter.bundesland = state;
+  }
+
+  const qRaw = firstQueryString(qs.q) ?? "";
+  const q = qRaw.trim().slice(0, 200);
+  if (q.length > 0) {
+    const rx = new RegExp(escapeRegex(q), "i");
+    filter.$or = [
+      { slug: rx },
+      { tradeCategory: rx },
+      { tradeCategoryDe: rx },
+      { companyName: rx },
+      { summary: rx },
+      { summaryDe: rx },
+      { gisaNumber: rx },
+      { authority: rx },
+      { addressLine: rx },
+      { city: rx },
+      { bundesland: rx },
+    ];
+  }
+
+  return { filter, q, state };
+}
+
+/**
+ * Unlock is per-listing. Either `listingId` or (`sellerId` + `listingSlug`) is
+ * required so older client builds keep working until they migrate.
+ */
+const unlockBody = z
+  .object({
+    listingId: objectIdString.optional(),
+    sellerId: objectIdString.optional(),
+    listingSlug: z.string().optional(),
+  })
+  .refine((v) => Boolean(v.listingId) || Boolean(v.listingSlug), {
+    message: "listing_required",
+  });
+
+/**
+ * Inquiries also gate on a per-listing unlock — buyers must unlock the exact
+ * listing they want to message about, not just any listing of the seller.
+ */
 const inquiryBody = z.object({
   sellerId: objectIdString,
+  listingId: objectIdString.optional(),
   listingSlug: z.string().optional(),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
@@ -46,11 +127,18 @@ const inquiryBody = z.object({
   phone: z.string().min(4),
   whatsapp: z.string().optional(),
   tradeInfo: z.string().optional(),
-  locationLabel: z.string().optional(),
-  lat: z.number().optional(),
-  lng: z.number().optional(),
+  houseNumber: z.string().optional(),
+  street: z.string().optional(),
+  postalCode: z.string().optional(),
+  city: z.string().optional(),
 });
 
+/**
+ * Locked teasers expose only public-safe identity (display label, slug, trade
+ * category). Sensitive fields — company name, summary, GISA, authority, full
+ * address, city, bundesland — are withheld until the buyer unlocks this
+ * specific listing.
+ */
 function listingToTeaser(
   l: {
     _id: Types.ObjectId;
@@ -67,24 +155,37 @@ function listingToTeaser(
     bundesland?: string | null;
     sellerId: Types.ObjectId;
   },
-  unlockedSellerIds: Set<string>
+  unlockedListingIds: Set<string>
 ) {
-  return {
-    id: String(l._id),
+  const id = String(l._id);
+  const unlocked = unlockedListingIds.has(id);
+  const base = {
+    id,
     slug: l.slug,
-    displayName: l.companyName?.trim() || l.tradeCategory,
     tradeCategory: l.tradeCategory,
-    tradeCategoryDe: l.tradeCategoryDe,
-    companyName: l.companyName,
-    summary: l.summary,
-    summaryDe: l.summaryDe,
-    gisaNumber: l.gisaNumber,
-    authority: l.authority,
-    addressLine: l.addressLine,
-    city: l.city,
-    bundesland: l.bundesland,
+    tradeCategoryDe: l.tradeCategoryDe ?? null,
     sellerId: String(l.sellerId),
-    unlocked: unlockedSellerIds.has(String(l.sellerId)),
+    unlocked,
+  };
+
+  if (!unlocked) {
+    return {
+      ...base,
+      displayName: l.tradeCategory,
+    };
+  }
+
+  return {
+    ...base,
+    displayName: l.companyName?.trim() || l.tradeCategory,
+    companyName: l.companyName ?? null,
+    summary: l.summary ?? null,
+    summaryDe: l.summaryDe ?? null,
+    gisaNumber: l.gisaNumber ?? null,
+    authority: l.authority ?? null,
+    addressLine: l.addressLine ?? null,
+    city: l.city ?? null,
+    bundesland: l.bundesland ?? null,
   };
 }
 
@@ -129,7 +230,15 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
     const invoicePL = parsePageLimitQuery(qs, { prefix: "invoice", defaultLimit: 20, maxLimit: 100 });
     const inquiryPL = parsePageLimitQuery(qs, { prefix: "inquiry", defaultLimit: 20, maxLimit: 100 });
 
-    const listingFilter = { status: "approved" as const, active: true };
+    /**
+     * Teaser query honors keyword (`q`) + state (`bundesland`) filters so the
+     * buyer directory mirrors the public landing search experience. The label
+     * lookup keeps the unfiltered set so cross-references (e.g. inquiry rows)
+     * still resolve when the directory is filtered down.
+     */
+    const { filter: listingFilter, q: teaserQ, state: teaserState } =
+      buildDirectoryListingFilter(qs);
+    const labelFilter = { status: "approved" as const, active: true };
 
     const [
       user,
@@ -144,7 +253,7 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
     ] = await Promise.all([
       UserModel.findById(buyerOid).lean(),
       isSellerProfileUnlockingEnabled(),
-      UnlockEventModel.find({ buyerId: buyerOid }).select("sellerId").lean(),
+      UnlockEventModel.find({ buyerId: buyerOid }).select("sellerId listingId").lean(),
       UnlockEventModel.aggregate([
         { $match: { buyerId: buyerOid } },
         {
@@ -176,11 +285,15 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       ListingModel.countDocuments(listingFilter),
       skipLabels
         ? Promise.resolve([] as { sellerId: unknown; companyName?: string | null; tradeCategory: string; slug: string }[])
-        : ListingModel.find(listingFilter).select({ sellerId: 1, companyName: 1, tradeCategory: 1, slug: 1 }).lean(),
+        : ListingModel.find(labelFilter).select({ sellerId: 1, companyName: 1, tradeCategory: 1, slug: 1 }).lean(),
     ]);
 
-    const unlockedSellerIds = new Set(unlockSellerRows.map((u) => String(u.sellerId)));
-    const unlocksCount = unlockedSellerIds.size;
+    const unlockedListingIds = new Set(
+      unlockSellerRows
+        .map((u) => (u.listingId ? String(u.listingId) : null))
+        .filter((v): v is string => Boolean(v))
+    );
+    const unlocksCount = unlockedListingIds.size;
 
     const directoryLabels = directoryLabelDocs.map((l) => ({
       sellerId: String(l.sellerId),
@@ -210,6 +323,10 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       whatsapp?: string | null;
       tradeInfo?: string | null;
       locationLabel?: string | null;
+      houseNumber?: string | null;
+      street?: string | null;
+      postalCode?: string | null;
+      city?: string | null;
       lat?: number | null;
       lng?: number | null;
       createdAt?: Date;
@@ -222,7 +339,7 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
         .skip(teaserPL.skip)
         .limit(teaserPL.limit)
         .lean();
-      teaserListings = slice.map((l) => listingToTeaser(l, unlockedSellerIds));
+      teaserListings = slice.map((l) => listingToTeaser(l, unlockedListingIds));
     }
 
     if (!skipInvoices) {
@@ -260,6 +377,10 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
         whatsapp: i.whatsapp,
         tradeInfo: i.tradeInfo,
         locationLabel: i.locationLabel,
+        houseNumber: i.houseNumber,
+        street: i.street,
+        postalCode: i.postalCode,
+        city: i.city,
         lat: i.lat,
         lng: i.lng,
         createdAt: i.createdAt,
@@ -289,6 +410,9 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       teaserPage: teaserPL.page,
       teaserLimit: teaserPL.limit,
       teaserTotalPages: totalPages(teaserTotal, teaserPL.limit),
+      teaserQ,
+      teaserState,
+      teaserBundeslaender: BUYER_DIRECTORY_BUNDESLAND,
       invoices: invoicesOut,
       invoicesTotal,
       invoicesPage: invoicePL.page,
@@ -351,7 +475,11 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
     return { result };
   });
 
-  /** Persists a permanent unlock for this buyer–seller pair (stored until explicitly removed by admins only). */
+  /**
+   * Persists a permanent unlock for this buyer–LISTING pair. Unlocks are per
+   * listing — unlocking one listing of a seller does NOT grant access to that
+   * seller's other listings.
+   */
   fastify.post("/buyer/unlock", { preHandler: buyerOnly }, async (request, reply) => {
     const parsed = unlockBody.safeParse(request.body);
     if (!parsed.success) {
@@ -363,24 +491,32 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
         message: SELLER_PROFILE_UNLOCKING_DISABLED_MESSAGE,
       });
     }
-    const sellerId = parsed.data.sellerId;
     const buyerId = request.authUser!.id;
     const buyerOid = new Types.ObjectId(buyerId);
-    const sellerOid = new Types.ObjectId(sellerId);
 
-    const listing = await ListingModel.findOne({
-      sellerId: sellerOid,
-      status: "approved",
-      active: true,
-    }).lean();
-    if (!listing) return reply.code(404).send({ error: "seller_not_listed" });
+    const listingFilter: Record<string, unknown> = { status: "approved", active: true };
+    if (parsed.data.listingId) {
+      listingFilter._id = new Types.ObjectId(parsed.data.listingId);
+    } else if (parsed.data.listingSlug) {
+      listingFilter.slug = parsed.data.listingSlug;
+      if (parsed.data.sellerId) {
+        listingFilter.sellerId = new Types.ObjectId(parsed.data.sellerId);
+      }
+    }
 
-    const existing = await UnlockEventModel.findOne({ buyerId: buyerOid, sellerId: sellerOid });
+    const listing = await ListingModel.findOne(listingFilter).lean();
+    if (!listing) return reply.code(404).send({ error: "listing_not_found" });
+
+    const existing = await UnlockEventModel.findOne({
+      buyerId: buyerOid,
+      listingId: listing._id,
+    });
     if (existing) {
       return {
         ok: true,
         alreadyUnlocked: true,
-        sellerId,
+        listingId: String(listing._id),
+        sellerId: String(listing.sellerId),
         slug: listing.slug,
         creditBalance: await readBuyerCredits(buyerId),
       };
@@ -403,7 +539,7 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
     try {
       await UnlockEventModel.create({
         buyerId: buyerOid,
-        sellerId: sellerOid,
+        sellerId: listing.sellerId,
         listingId: listing._id,
         creditsUsed: 1,
       });
@@ -413,7 +549,8 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
         return {
           ok: true,
           alreadyUnlocked: true,
-          sellerId,
+          listingId: String(listing._id),
+          sellerId: String(listing.sellerId),
           slug: listing.slug,
           creditBalance: await readBuyerCredits(buyerId),
         };
@@ -423,7 +560,8 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
 
     return {
       ok: true,
-      sellerId,
+      listingId: String(listing._id),
+      sellerId: String(listing.sellerId),
       slug: listing.slug,
       creditBalance: dec.creditBalance ?? 0,
     };
@@ -436,15 +574,17 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
     }
     const b = parsed.data;
     const buyerId = request.authUser!.id;
+    const buyerOid = new Types.ObjectId(buyerId);
 
-    const unlocked = await UnlockEventModel.exists({
-      buyerId: new Types.ObjectId(buyerId),
-      sellerId: new Types.ObjectId(b.sellerId),
-    });
-    if (!unlocked) return reply.code(403).send({ error: "unlock_required" });
-
-    let listingId = null as Types.ObjectId | null;
-    if (b.listingSlug) {
+    let listingId: Types.ObjectId | null = null;
+    if (b.listingId) {
+      const l = await ListingModel.findOne({
+        _id: new Types.ObjectId(b.listingId),
+        sellerId: new Types.ObjectId(b.sellerId),
+        status: "approved",
+      });
+      if (l) listingId = l._id;
+    } else if (b.listingSlug) {
       const l = await ListingModel.findOne({
         slug: b.listingSlug,
         sellerId: new Types.ObjectId(b.sellerId),
@@ -452,6 +592,23 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       });
       if (l) listingId = l._id;
     }
+
+    if (!listingId) {
+      return reply.code(400).send({ error: "listing_required" });
+    }
+
+    const unlocked = await UnlockEventModel.exists({
+      buyerId: buyerOid,
+      listingId,
+    });
+    if (!unlocked) return reply.code(403).send({ error: "unlock_required" });
+
+    const locationDisplay = formatInquiryAddressLine({
+      houseNumber: b.houseNumber,
+      street: b.street,
+      postalCode: b.postalCode,
+      city: b.city,
+    });
 
     const doc = await InquiryModel.create({
       buyerId,
@@ -463,9 +620,10 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       phone: b.phone,
       whatsapp: b.whatsapp,
       tradeInfo: b.tradeInfo,
-      locationLabel: b.locationLabel,
-      lat: b.lat,
-      lng: b.lng,
+      houseNumber: b.houseNumber,
+      street: b.street,
+      postalCode: b.postalCode,
+      city: b.city,
     });
 
     try {
@@ -483,7 +641,7 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
             phone: b.phone,
             whatsapp: b.whatsapp,
             tradeInfo: b.tradeInfo,
-            locationLabel: b.locationLabel,
+            locationDisplay,
             listingSlug: b.listingSlug,
           },
         });

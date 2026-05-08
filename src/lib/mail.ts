@@ -51,7 +51,8 @@ export async function sendSellerInquiryNotification(opts: {
     phone: string;
     whatsapp?: string;
     tradeInfo?: string;
-    locationLabel?: string;
+    /** Single formatted address line (structured fields or legacy label) */
+    locationDisplay?: string;
     listingSlug?: string;
   };
 }) {
@@ -64,7 +65,7 @@ export async function sendSellerInquiryNotification(opts: {
     `Email: ${inquiry.email}`,
     `Phone: ${inquiry.phone}`,
     inquiry.whatsapp ? `WhatsApp: ${inquiry.whatsapp}` : null,
-    inquiry.locationLabel ? `Location: ${inquiry.locationLabel}` : null,
+    inquiry.locationDisplay ? `Location: ${inquiry.locationDisplay}` : null,
     inquiry.listingSlug ? `Listing slug: ${inquiry.listingSlug}` : null,
     inquiry.tradeInfo ? `\nMessage:\n${inquiry.tradeInfo}` : null,
     "",
@@ -86,8 +87,8 @@ export async function sendSellerInquiryNotification(opts: {
         ? `<br/><strong>WhatsApp:</strong> ${escapeHtml(inquiry.whatsapp)}`
         : ""
     }${
-      inquiry.locationLabel
-        ? `<br/><strong>Location:</strong> ${escapeHtml(inquiry.locationLabel)}`
+      inquiry.locationDisplay
+        ? `<br/><strong>Location:</strong> ${escapeHtml(inquiry.locationDisplay)}`
         : ""
     }${
       inquiry.listingSlug

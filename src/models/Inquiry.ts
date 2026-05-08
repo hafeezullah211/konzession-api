@@ -11,7 +11,12 @@ const inquirySchema = new Schema(
     phone: { type: String, required: true, trim: true },
     whatsapp: { type: String, trim: true },
     tradeInfo: { type: String, trim: true },
+    /** Legacy single-line location before structured address fields */
     locationLabel: { type: String, trim: true },
+    houseNumber: { type: String, trim: true },
+    street: { type: String, trim: true },
+    postalCode: { type: String, trim: true },
+    city: { type: String, trim: true },
     lat: { type: Number, default: null },
     lng: { type: Number, default: null },
   },

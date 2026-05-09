@@ -5,6 +5,11 @@ import Fastify from "fastify";
 
 import { loadConfig } from "./config.js";
 import { connectDb } from "./db.js";
+import {
+  buildCorsOriginMatcher,
+  describeCorsRules,
+  parseCorsOrigins,
+} from "./lib/cors-origins.js";
 import { ensureUnlockEventIndexes } from "./lib/index-migrations.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 import { registerAuthRoutes } from "./routes/auth.js";
@@ -15,21 +20,52 @@ import { registerSellerRoutes } from "./routes/seller.js";
 import { registerRequestLogging } from "./request-logging.js";
 import { seedAdminIfNeeded } from "./seed.js";
 
+/**
+ * Surface late async failures (Mongo disconnect, SMTP, etc.) so Railway's logs
+ * show the actual cause instead of silently 502-ing on the next request.
+ */
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+
 async function main() {
   const cfg = loadConfig();
-  await connectDb(cfg.MONGODB_URI);
+
+  try {
+    await connectDb(cfg.MONGODB_URI);
+  } catch (err) {
+    console.error(
+      "[startup] MongoDB connection failed. Verify MONGODB_URI and that the cluster's IP allowlist accepts requests from Railway (Atlas: Network Access → 0.0.0.0/0 or the Railway egress IPs).",
+      err
+    );
+    throw err;
+  }
+
   await ensureUnlockEventIndexes();
   await seedAdminIfNeeded(cfg);
 
   const app = Fastify({ logger: true });
   registerRequestLogging(app);
 
-  const origins = cfg.CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
-  /** Include PATCH/PUT/DELETE: default @fastify/cors methods are only GET, HEAD, POST — without these, browser preflight blocks cross-origin writes. */
+  /**
+   * `CORS_ORIGINS` is a comma-separated list. We tolerate trailing slashes and
+   * support `*.vercel.app`-style wildcards so Vercel preview deployments work
+   * without redeploying the API every time a new preview URL is generated.
+   */
+  const corsRules = parseCorsOrigins(cfg.CORS_ORIGINS);
+  app.log.info({ corsRules: describeCorsRules(corsRules) }, "[startup] CORS origins registered");
   await app.register(cors, {
-    origin: origins.length ? origins : true,
+    origin: buildCorsOriginMatcher(corsRules),
     credentials: true,
+    /** Default @fastify/cors methods are only GET, HEAD, POST — without these, browser preflight blocks cross-origin writes. */
     methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    /** Mirrors the headers the browser asks for in `Access-Control-Request-Headers`. */
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+    /** Some preflights (Safari, older Edge) require an explicit 204. */
+    optionsSuccessStatus: 204,
   });
 
   await registerPublicRoutes(app, cfg);
@@ -68,6 +104,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error("[fatal] API failed to start:", err);
   process.exit(1);
 });

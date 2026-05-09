@@ -23,9 +23,11 @@ async function main() {
   registerRequestLogging(app);
 
   const origins = cfg.CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
+  /** Include PATCH/PUT/DELETE: default @fastify/cors methods are only GET, HEAD, POST — without these, browser preflight blocks cross-origin writes. */
   await app.register(cors, {
     origin: origins.length ? origins : true,
     credentials: true,
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   });
 
   await registerPublicRoutes(app, cfg);

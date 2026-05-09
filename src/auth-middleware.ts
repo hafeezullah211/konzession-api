@@ -27,6 +27,9 @@ export async function authenticate(
     const payload = verifyAccessToken(cfg, token);
     const dbUser = await UserModel.findById(payload.sub).lean();
     if (!dbUser) return reply.code(401).send({ error: "invalid_user" });
+    if (dbUser.accountBlocked) {
+      return reply.code(403).send({ error: "account_blocked" });
+    }
     if (roles && !roles.includes(dbUser.role)) {
       return reply.code(403).send({ error: "forbidden" });
     }

@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import type { Config } from "../config.js";
 import { authenticate } from "../auth-middleware.js";
+import { parsePageLimitQuery, totalPages } from "../lib/pagination.js";
 import { sellerMonthlyAmountCents } from "../lib/seller-plan-amount.js";
 import { uniqueSlug } from "../lib/slug.js";
 import { InquiryModel } from "../models/Inquiry.js";
@@ -45,33 +46,44 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
   fastify.get("/seller/dashboard/summary", { preHandler: sellerOnly }, async (request, _reply) => {
     const sellerId = request.authUser!.id;
     const oid = new Types.ObjectId(sellerId);
-    const inquiriesByDay = await InquiryModel.aggregate([
-      { $match: { sellerId: oid } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" } },
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { _id: 1 } },
-    ]);
-
-    const sellerProfile = await UserModel.findById(oid).lean();
-
-    const invoices = await InvoiceModel.find({ userId: oid }).sort({ createdAt: -1 }).limit(50).lean();
-    const pendingListings = await ListingModel.countDocuments({ sellerId: oid, status: "pending" });
-    const approvedListings = await ListingModel.countDocuments({ sellerId: oid, status: "approved" });
-    const totalInquiries = await InquiryModel.countDocuments({ sellerId: oid });
-
-    const recentInquiries = await InquiryModel.find({ sellerId: oid })
-      .sort({ createdAt: -1 })
-      .limit(20)
-      .lean();
+    const [inquiriesByDay, invoiceAmountByDay, sellerProfile, pendingListings, approvedListings, totalInquiries] =
+      await Promise.all([
+        InquiryModel.aggregate([
+          { $match: { sellerId: oid } },
+          {
+            $group: {
+              _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" } },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+          { $limit: 120 },
+        ]),
+        InvoiceModel.aggregate([
+          { $match: { userId: oid } },
+          {
+            $group: {
+              _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" } },
+              amountCents: { $sum: "$amountCents" },
+            },
+          },
+          { $sort: { _id: 1 } },
+          { $limit: 120 },
+        ]),
+        UserModel.findById(oid).lean(),
+        ListingModel.countDocuments({ sellerId: oid, status: "pending" }),
+        ListingModel.countDocuments({ sellerId: oid, status: "approved" }),
+        InquiryModel.countDocuments({ sellerId: oid }),
+      ]);
 
     const plan = (sellerProfile?.subscriptionPlan === "vip" ? "vip" : "basic") as "basic" | "vip";
 
     return {
       inquiriesByDay,
+      invoiceAmountByDay: invoiceAmountByDay.map((r) => ({
+        day: r._id as string,
+        amountCents: r.amountCents as number,
+      })),
       billing: {
         subscriptionPlan: sellerProfile?.subscriptionPlan ?? null,
         subscriptionStatus: sellerProfile?.subscriptionStatus ?? null,
@@ -87,7 +99,53 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
       totals: {
         inquiries: totalInquiries,
       },
-      recentInquiries: recentInquiries.map((i) => ({
+      listingCounts: { pending: pendingListings, approved: approvedListings },
+    };
+  });
+
+  fastify.get("/seller/invoices", { preHandler: sellerOnly }, async (request) => {
+    const oid = new Types.ObjectId(request.authUser!.id);
+    const { page, limit, skip } = parsePageLimitQuery(
+      (request.query ?? {}) as Record<string, unknown>,
+      { defaultLimit: 20, maxLimit: 100 }
+    );
+    const [invoices, total] = await Promise.all([
+      InvoiceModel.find({ userId: oid }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      InvoiceModel.countDocuments({ userId: oid }),
+    ]);
+    return {
+      invoices: invoices.map((inv) => ({
+        id: String(inv._id),
+        type: inv.type,
+        amountCents: inv.amountCents,
+        currency: inv.currency,
+        stripeCheckoutSessionId: inv.stripeCheckoutSessionId,
+        stripePaymentIntentId: inv.stripePaymentIntentId,
+        stripeInvoiceId: inv.stripeInvoiceId,
+        description: inv.description,
+        metadata: inv.metadata,
+        createdAt: inv.createdAt,
+        updatedAt: inv.updatedAt,
+      })),
+      total,
+      page,
+      limit,
+      totalPages: totalPages(total, limit),
+    };
+  });
+
+  fastify.get("/seller/inquiries", { preHandler: sellerOnly }, async (request) => {
+    const oid = new Types.ObjectId(request.authUser!.id);
+    const { page, limit, skip } = parsePageLimitQuery(
+      (request.query ?? {}) as Record<string, unknown>,
+      { defaultLimit: 20, maxLimit: 100 }
+    );
+    const [rows, total] = await Promise.all([
+      InquiryModel.find({ sellerId: oid }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      InquiryModel.countDocuments({ sellerId: oid }),
+    ]);
+    return {
+      inquiries: rows.map((i) => ({
         id: String(i._id),
         buyerId: String(i.buyerId),
         listingId: i.listingId ? String(i.listingId) : null,
@@ -103,20 +161,10 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
         createdAt: i.createdAt,
         updatedAt: i.updatedAt,
       })),
-      invoices: invoices.map((inv) => ({
-        id: String(inv._id),
-        type: inv.type,
-        amountCents: inv.amountCents,
-        currency: inv.currency,
-        stripeCheckoutSessionId: inv.stripeCheckoutSessionId,
-        stripePaymentIntentId: inv.stripePaymentIntentId,
-        stripeInvoiceId: inv.stripeInvoiceId,
-        description: inv.description,
-        metadata: inv.metadata,
-        createdAt: inv.createdAt,
-        updatedAt: inv.updatedAt,
-      })),
-      listingCounts: { pending: pendingListings, approved: approvedListings },
+      total,
+      page,
+      limit,
+      totalPages: totalPages(total, limit),
     };
   });
 

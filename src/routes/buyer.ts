@@ -12,6 +12,7 @@ import { InquiryModel } from "../models/Inquiry.js";
 import { InvoiceModel } from "../models/Invoice.js";
 import { ListingModel } from "../models/Listing.js";
 import { UserModel } from "../models/User.js";
+import { parsePageLimitQuery, totalPages } from "../lib/pagination.js";
 import {
   isSellerProfileUnlockingEnabled,
   SELLER_PROFILE_UNLOCKING_DISABLED_MESSAGE,
@@ -50,6 +51,42 @@ const inquiryBody = z.object({
   lng: z.number().optional(),
 });
 
+function listingToTeaser(
+  l: {
+    _id: Types.ObjectId;
+    slug: string;
+    tradeCategory: string;
+    tradeCategoryDe?: string | null;
+    companyName?: string | null;
+    summary?: string | null;
+    summaryDe?: string | null;
+    gisaNumber?: string | null;
+    authority?: string | null;
+    addressLine?: string | null;
+    city?: string | null;
+    bundesland?: string | null;
+    sellerId: Types.ObjectId;
+  },
+  unlockedSellerIds: Set<string>
+) {
+  return {
+    id: String(l._id),
+    slug: l.slug,
+    displayName: l.companyName?.trim() || l.tradeCategory,
+    tradeCategory: l.tradeCategory,
+    tradeCategoryDe: l.tradeCategoryDe,
+    companyName: l.companyName,
+    summary: l.summary,
+    summaryDe: l.summaryDe,
+    gisaNumber: l.gisaNumber,
+    authority: l.authority,
+    addressLine: l.addressLine,
+    city: l.city,
+    bundesland: l.bundesland,
+    sellerId: String(l.sellerId),
+    unlocked: unlockedSellerIds.has(String(l.sellerId)),
+  };
+}
 
 export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config) {
   const buyerOnly = async (request: import("fastify").FastifyRequest, reply: import("fastify").FastifyReply) =>
@@ -61,62 +98,158 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
   }
 
   fastify.get("/buyer/dashboard/summary", { preHandler: buyerOnly }, async (request) => {
+    const qs = (request.query ?? {}) as Record<string, unknown>;
     const buyerId = request.authUser!.id;
     const buyerOid = new Types.ObjectId(buyerId);
 
-    /** Permanent unlocks: one row per buyer–seller pair; never expires or auto-resets. */
-    const unlocks = await UnlockEventModel.find({ buyerId: buyerOid }).lean();
-    const unlockedSellerIds = new Set(unlocks.map((u) => String(u.sellerId)));
+    if (qs.compact === "1" || qs.compact === "true") {
+      const user = await UserModel.findById(buyerOid).select("creditBalance").lean();
+      const sellerProfileUnlockingEnabled = await isSellerProfileUnlockingEnabled();
+      return {
+        creditBalance: user?.creditBalance ?? 0,
+        sellerProfileUnlockingEnabled,
+        sellerProfileUnlockingDisabledMessage: sellerProfileUnlockingEnabled
+          ? null
+          : SELLER_PROFILE_UNLOCKING_DISABLED_MESSAGE,
+      };
+    }
 
-    const invoices = await InvoiceModel.find({ userId: buyerOid }).sort({ createdAt: -1 }).limit(50).lean();
+    const omit = new Set(
+      String(qs.omit ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+    const skipTeasers = omit.has("teasers");
+    const skipInvoices = omit.has("invoices");
+    const skipInquiries = omit.has("inquiries");
+    const skipLabels = omit.has("labels");
 
-    const user = await UserModel.findById(buyerOid).lean();
+    const teaserPL = parsePageLimitQuery(qs, { prefix: "teaser", defaultLimit: 25, maxLimit: 100 });
+    const invoicePL = parsePageLimitQuery(qs, { prefix: "invoice", defaultLimit: 20, maxLimit: 100 });
+    const inquiryPL = parsePageLimitQuery(qs, { prefix: "inquiry", defaultLimit: 20, maxLimit: 100 });
 
-    const allApproved = await ListingModel.find({ status: "approved", active: true }).lean();
-    const teaser = allApproved.map((l) => ({
-      id: String(l._id),
+    const listingFilter = { status: "approved" as const, active: true };
+
+    const [
+      user,
+      sellerProfileUnlockingEnabled,
+      unlockSellerRows,
+      unlockActivityByDay,
+      inquiryActivityByDay,
+      inquiriesTotal,
+      invoicesTotal,
+      teaserTotal,
+      directoryLabelDocs,
+    ] = await Promise.all([
+      UserModel.findById(buyerOid).lean(),
+      isSellerProfileUnlockingEnabled(),
+      UnlockEventModel.find({ buyerId: buyerOid }).select("sellerId").lean(),
+      UnlockEventModel.aggregate([
+        { $match: { buyerId: buyerOid } },
+        {
+          $group: {
+            _id: {
+              $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" },
+            },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+        { $limit: 120 },
+      ]),
+      InquiryModel.aggregate([
+        { $match: { buyerId: buyerOid } },
+        {
+          $group: {
+            _id: {
+              $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" },
+            },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+        { $limit: 120 },
+      ]),
+      InquiryModel.countDocuments({ buyerId: buyerOid }),
+      InvoiceModel.countDocuments({ userId: buyerOid }),
+      ListingModel.countDocuments(listingFilter),
+      skipLabels
+        ? Promise.resolve([] as { sellerId: unknown; companyName?: string | null; tradeCategory: string; slug: string }[])
+        : ListingModel.find(listingFilter).select({ sellerId: 1, companyName: 1, tradeCategory: 1, slug: 1 }).lean(),
+    ]);
+
+    const unlockedSellerIds = new Set(unlockSellerRows.map((u) => String(u.sellerId)));
+    const unlocksCount = unlockedSellerIds.size;
+
+    const directoryLabels = directoryLabelDocs.map((l) => ({
+      sellerId: String(l.sellerId),
       slug: l.slug,
       displayName: l.companyName?.trim() || l.tradeCategory,
-      tradeCategory: l.tradeCategory,
-      tradeCategoryDe: l.tradeCategoryDe,
-      companyName: l.companyName,
-      summary: l.summary,
-      summaryDe: l.summaryDe,
-      gisaNumber: l.gisaNumber,
-      authority: l.authority,
-      addressLine: l.addressLine,
-      city: l.city,
-      bundesland: l.bundesland,
-      sellerId: String(l.sellerId),
-      unlocked: unlockedSellerIds.has(String(l.sellerId)),
     }));
 
-    const inquiries = await InquiryModel.find({ buyerId: buyerOid })
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .lean();
+    let teaserListings: ReturnType<typeof listingToTeaser>[] = [];
+    let invoicesOut: {
+      id: string;
+      type: string;
+      amountCents: number;
+      currency: string;
+      description?: string | null;
+      metadata?: unknown;
+      stripeCheckoutSessionId?: string | null;
+      createdAt?: Date;
+    }[] = [];
+    let inquiriesOut: {
+      id: string;
+      sellerId: string;
+      listingId: string | null;
+      firstName?: string;
+      lastName?: string;
+      email?: string;
+      phone?: string;
+      whatsapp?: string | null;
+      tradeInfo?: string | null;
+      locationLabel?: string | null;
+      lat?: number | null;
+      lng?: number | null;
+      createdAt?: Date;
+      updatedAt?: Date;
+    }[] = [];
 
-    const sellerProfileUnlockingEnabled = await isSellerProfileUnlockingEnabled();
+    if (!skipTeasers) {
+      const slice = await ListingModel.find(listingFilter)
+        .sort({ createdAt: -1 })
+        .skip(teaserPL.skip)
+        .limit(teaserPL.limit)
+        .lean();
+      teaserListings = slice.map((l) => listingToTeaser(l, unlockedSellerIds));
+    }
 
-    return {
-      creditBalance: user?.creditBalance ?? 0,
-      sellerProfileUnlockingEnabled,
-      sellerProfileUnlockingDisabledMessage: sellerProfileUnlockingEnabled
-        ? null
-        : SELLER_PROFILE_UNLOCKING_DISABLED_MESSAGE,
-      unlocks: unlocks.map((u) => ({ sellerId: String(u.sellerId), createdAt: u.createdAt })),
-      teaserListings: teaser,
-      invoices: invoices.map((inv) => ({
-        id: String(inv._id),
-        type: inv.type,
-        amountCents: inv.amountCents,
-        currency: inv.currency,
-        description: inv.description,
-        metadata: inv.metadata,
-        stripeCheckoutSessionId: inv.stripeCheckoutSessionId,
-        createdAt: inv.createdAt,
-      })),
-      inquiries: inquiries.map((i) => ({
+    if (!skipInvoices) {
+      const inv = await InvoiceModel.find({ userId: buyerOid })
+        .sort({ createdAt: -1 })
+        .skip(invoicePL.skip)
+        .limit(invoicePL.limit)
+        .lean();
+      invoicesOut = inv.map((invDoc) => ({
+        id: String(invDoc._id),
+        type: invDoc.type,
+        amountCents: invDoc.amountCents,
+        currency: invDoc.currency,
+        description: invDoc.description,
+        metadata: invDoc.metadata,
+        stripeCheckoutSessionId: invDoc.stripeCheckoutSessionId,
+        createdAt: invDoc.createdAt,
+      }));
+    }
+
+    if (!skipInquiries) {
+      const iq = await InquiryModel.find({ buyerId: buyerOid })
+        .sort({ createdAt: -1 })
+        .skip(inquiryPL.skip)
+        .limit(inquiryPL.limit)
+        .lean();
+      inquiriesOut = iq.map((i) => ({
         id: String(i._id),
         sellerId: String(i.sellerId),
         listingId: i.listingId ? String(i.listingId) : null,
@@ -131,7 +264,41 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
         lng: i.lng,
         createdAt: i.createdAt,
         updatedAt: i.updatedAt,
+      }));
+    }
+
+    return {
+      creditBalance: user?.creditBalance ?? 0,
+      sellerProfileUnlockingEnabled,
+      sellerProfileUnlockingDisabledMessage: sellerProfileUnlockingEnabled
+        ? null
+        : SELLER_PROFILE_UNLOCKING_DISABLED_MESSAGE,
+      unlocksCount,
+      inquiriesCount: inquiriesTotal,
+      unlockActivityByDay: unlockActivityByDay.map((r) => ({
+        day: r._id as string,
+        count: r.count as number,
       })),
+      inquiryActivityByDay: inquiryActivityByDay.map((r) => ({
+        day: r._id as string,
+        count: r.count as number,
+      })),
+      directoryLabels,
+      teaserListings,
+      teaserTotal,
+      teaserPage: teaserPL.page,
+      teaserLimit: teaserPL.limit,
+      teaserTotalPages: totalPages(teaserTotal, teaserPL.limit),
+      invoices: invoicesOut,
+      invoicesTotal,
+      invoicesPage: invoicePL.page,
+      invoicesLimit: invoicePL.limit,
+      invoicesTotalPages: totalPages(invoicesTotal, invoicePL.limit),
+      inquiries: inquiriesOut,
+      inquiriesTotal,
+      inquiriesPage: inquiryPL.page,
+      inquiriesLimit: inquiryPL.limit,
+      inquiriesTotalPages: totalPages(inquiriesTotal, inquiryPL.limit),
     };
   });
 

@@ -25,6 +25,14 @@ const userSchema = new Schema(
     /** Legacy (unused): buyer profile-access trial end; unlocks always cost credits now. */
     buyerProfileTrialEndsAt: { type: Date, default: null },
     creditBalance: { type: Number, default: 0, min: 0 },
+    /** When true, login and API access are denied until an admin unblocks. */
+    accountBlocked: { type: Boolean, default: false, index: true },
+    /**
+     * Mirrored from Stripe for seller subscriptions: when true, subscription ends at
+     * `subscriptionCurrentPeriodEnd` (no further charges). Updated via webhooks and cancel flows.
+     */
+    subscriptionCancelAtPeriodEnd: { type: Boolean, default: false },
+    subscriptionCurrentPeriodEnd: { type: Date, default: null },
     passwordResetTokenHash: { type: String, default: null, index: true, sparse: true },
     passwordResetExpiresAt: { type: Date, default: null },
   },

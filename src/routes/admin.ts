@@ -1,8 +1,11 @@
 import type { FastifyInstance } from "fastify";
+import { Types } from "mongoose";
 import { z } from "zod";
 
 import type { Config } from "../config.js";
 import { authenticate } from "../auth-middleware.js";
+import { getStripe } from "../lib/stripe-client.js";
+import { parsePageLimitQuery, totalPages } from "../lib/pagination.js";
 import {
   isSellerProfileUnlockingEnabled,
   setSellerProfileUnlockingEnabled,
@@ -12,8 +15,31 @@ import { CreditTransactionModel } from "../models/CreditTransaction.js";
 import { InquiryModel } from "../models/Inquiry.js";
 import { InvoiceModel } from "../models/Invoice.js";
 import { ListingModel } from "../models/Listing.js";
+import { RefreshTokenModel } from "../models/RefreshToken.js";
 import { UnlockEventModel } from "../models/UnlockEvent.js";
 import { UserModel } from "../models/User.js";
+
+async function deleteUserAndRelatedData(
+  cfg: Config,
+  userId: Types.ObjectId,
+  stripeSubscriptionId: string | null | undefined
+): Promise<void> {
+  const stripe = getStripe(cfg);
+  if (stripe && stripeSubscriptionId) {
+    try {
+      await stripe.subscriptions.cancel(stripeSubscriptionId);
+    } catch {
+      /* already removed */
+    }
+  }
+  await RefreshTokenModel.deleteMany({ userId });
+  await UnlockEventModel.deleteMany({ $or: [{ buyerId: userId }, { sellerId: userId }] });
+  await InquiryModel.deleteMany({ $or: [{ buyerId: userId }, { sellerId: userId }] });
+  await InvoiceModel.deleteMany({ userId });
+  await CreditTransactionModel.deleteMany({ buyerId: userId });
+  await ListingModel.deleteMany({ sellerId: userId });
+  await UserModel.deleteOne({ _id: userId });
+}
 
 export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config) {
   const adminOnly = async (request: import("fastify").FastifyRequest, reply: import("fastify").FastifyReply) =>
@@ -74,30 +100,56 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
     };
   });
 
-  fastify.get<{ Querystring: { role?: string } }>("/admin/users", { preHandler: adminOnly }, async (request) => {
-    const role = request.query.role as "seller" | "buyer" | undefined;
-    const q =
-      role === "seller" || role === "buyer" ? { role } : { role: { $in: ["seller", "buyer"] } };
-    const users = await UserModel.find(q).sort({ createdAt: -1 }).limit(500).lean();
-    return {
-      users: users.map((u) => ({
-        id: String(u._id),
-        email: u.email,
-        role: u.role,
-        firstName: u.firstName,
-        lastName: u.lastName,
-        phone: u.phone,
-        tradeType: u.tradeType,
-        subscriptionPlan: u.subscriptionPlan,
-        subscriptionStatus: u.subscriptionStatus,
-        creditBalance: u.creditBalance,
-        createdAt: u.createdAt,
-      })),
-    };
-  });
+  fastify.get<{ Querystring: { role?: string; page?: string; limit?: string } }>(
+    "/admin/users",
+    { preHandler: adminOnly },
+    async (request) => {
+      const role = request.query.role as "seller" | "buyer" | undefined;
+      const q =
+        role === "seller" || role === "buyer" ? { role } : { role: { $in: ["seller", "buyer"] } };
+      const { page, limit, skip } = parsePageLimitQuery(
+        (request.query ?? {}) as Record<string, unknown>,
+        { defaultLimit: 20, maxLimit: 100 }
+      );
+      const [users, total] = await Promise.all([
+        UserModel.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+        UserModel.countDocuments(q),
+      ]);
+      return {
+        users: users.map((u) => ({
+          id: String(u._id),
+          email: u.email,
+          role: u.role,
+          firstName: u.firstName,
+          lastName: u.lastName,
+          phone: u.phone,
+          tradeType: u.tradeType,
+          subscriptionPlan: u.subscriptionPlan,
+          subscriptionStatus: u.subscriptionStatus,
+          creditBalance: u.creditBalance,
+          accountBlocked: u.accountBlocked ?? false,
+          subscriptionCancelAtPeriodEnd: u.subscriptionCancelAtPeriodEnd ?? false,
+          subscriptionCurrentPeriodEnd: u.subscriptionCurrentPeriodEnd ?? null,
+          stripeSubscriptionId: u.stripeSubscriptionId ?? null,
+          createdAt: u.createdAt,
+        })),
+        total,
+        page,
+        limit,
+        totalPages: totalPages(total, limit),
+      };
+    }
+  );
 
-  fastify.get("/admin/contact-submissions", { preHandler: adminOnly }, async () => {
-    const rows = await ContactSubmissionModel.find().sort({ createdAt: -1 }).limit(500).lean();
+  fastify.get("/admin/contact-submissions", { preHandler: adminOnly }, async (request) => {
+    const { page, limit, skip } = parsePageLimitQuery(
+      (request.query ?? {}) as Record<string, unknown>,
+      { defaultLimit: 20, maxLimit: 100 }
+    );
+    const [rows, total] = await Promise.all([
+      ContactSubmissionModel.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      ContactSubmissionModel.countDocuments(),
+    ]);
     return {
       rows: rows.map((r) => ({
         id: String(r._id),
@@ -108,14 +160,23 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
         tradeCategory: r.tradeCategory,
         createdAt: r.createdAt,
       })),
+      total,
+      page,
+      limit,
+      totalPages: totalPages(total, limit),
     };
   });
 
-  fastify.get("/admin/listings/pending", { preHandler: adminOnly }, async () => {
-    const listings = await ListingModel.find({ status: "pending" })
-      .sort({ createdAt: 1 })
-      .limit(200)
-      .lean();
+  fastify.get("/admin/listings/pending", { preHandler: adminOnly }, async (request) => {
+    const { page, limit, skip } = parsePageLimitQuery(
+      (request.query ?? {}) as Record<string, unknown>,
+      { defaultLimit: 20, maxLimit: 100 }
+    );
+    const filter = { status: "pending" as const };
+    const [listings, total] = await Promise.all([
+      ListingModel.find(filter).sort({ createdAt: 1 }).skip(skip).limit(limit).lean(),
+      ListingModel.countDocuments(filter),
+    ]);
     return {
       listings: listings.map((l) => ({
         id: String(l._id),
@@ -137,6 +198,10 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
         createdAt: l.createdAt,
         updatedAt: l.updatedAt,
       })),
+      total,
+      page,
+      limit,
+      totalPages: totalPages(total, limit),
     };
   });
 
@@ -174,8 +239,15 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
     }
   );
 
-  fastify.get("/admin/unlocks", { preHandler: adminOnly }, async () => {
-    const rows = await UnlockEventModel.find().sort({ createdAt: -1 }).limit(300).lean();
+  fastify.get("/admin/unlocks", { preHandler: adminOnly }, async (request) => {
+    const { page, limit, skip } = parsePageLimitQuery(
+      (request.query ?? {}) as Record<string, unknown>,
+      { defaultLimit: 20, maxLimit: 100 }
+    );
+    const [rows, total] = await Promise.all([
+      UnlockEventModel.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      UnlockEventModel.countDocuments(),
+    ]);
     return {
       rows: rows.map((r) => ({
         buyerId: String(r.buyerId),
@@ -183,11 +255,22 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
         creditsUsed: r.creditsUsed,
         createdAt: r.createdAt,
       })),
+      total,
+      page,
+      limit,
+      totalPages: totalPages(total, limit),
     };
   });
 
-  fastify.get("/admin/credit-transactions", { preHandler: adminOnly }, async () => {
-    const rows = await CreditTransactionModel.find().sort({ createdAt: -1 }).limit(300).lean();
+  fastify.get("/admin/credit-transactions", { preHandler: adminOnly }, async (request) => {
+    const { page, limit, skip } = parsePageLimitQuery(
+      (request.query ?? {}) as Record<string, unknown>,
+      { defaultLimit: 20, maxLimit: 100 }
+    );
+    const [rows, total] = await Promise.all([
+      CreditTransactionModel.find().sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      CreditTransactionModel.countDocuments(),
+    ]);
     return {
       rows: rows.map((r) => ({
         buyerId: String(r.buyerId),
@@ -195,6 +278,10 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
         amountCents: r.amountCents,
         createdAt: r.createdAt,
       })),
+      total,
+      page,
+      limit,
+      totalPages: totalPages(total, limit),
     };
   });
 
@@ -217,4 +304,86 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
     );
     return { sellerProfileUnlockingEnabled };
   });
+
+  const userIdParam = z.object({
+    id: z.string().refine((s) => Types.ObjectId.isValid(s), { message: "bad_id" }),
+  });
+  const accountBlockBody = z.object({
+    accountBlocked: z.boolean(),
+  });
+
+  fastify.patch<{ Params: { id: string }; Body: unknown }>(
+    "/admin/users/:id/account",
+    { preHandler: adminOnly },
+    async (request, reply) => {
+      const p = userIdParam.safeParse(request.params);
+      if (!p.success) return reply.code(400).send({ error: "bad_id" });
+      const body = accountBlockBody.safeParse(request.body);
+      if (!body.success) {
+        return reply.code(400).send({ error: "validation", details: body.error.flatten() });
+      }
+      const adminId = request.authUser!.id;
+      if (p.data.id === adminId) return reply.code(400).send({ error: "cannot_modify_self" });
+
+      const target = await UserModel.findById(p.data.id);
+      if (!target) return reply.code(404).send({ error: "not_found" });
+      if (target.role === "admin") return reply.code(403).send({ error: "cannot_modify_admin" });
+
+      target.accountBlocked = body.data.accountBlocked;
+      await target.save();
+      if (body.data.accountBlocked) {
+        await RefreshTokenModel.deleteMany({ userId: target._id });
+      }
+      return { ok: true, accountBlocked: target.accountBlocked };
+    }
+  );
+
+  fastify.delete<{ Params: { id: string } }>("/admin/users/:id", { preHandler: adminOnly }, async (request, reply) => {
+    const p = userIdParam.safeParse(request.params);
+    if (!p.success) return reply.code(400).send({ error: "bad_id" });
+    const adminId = request.authUser!.id;
+    if (p.data.id === adminId) return reply.code(400).send({ error: "cannot_delete_self" });
+
+    const target = await UserModel.findById(p.data.id);
+    if (!target) return reply.code(404).send({ error: "not_found" });
+    if (target.role === "admin") return reply.code(403).send({ error: "cannot_delete_admin" });
+
+    await deleteUserAndRelatedData(cfg, target._id, target.stripeSubscriptionId);
+    return { ok: true };
+  });
+
+  fastify.post<{ Params: { id: string } }>(
+    "/admin/users/:id/cancel-subscription",
+    { preHandler: adminOnly },
+    async (request, reply) => {
+      const p = userIdParam.safeParse(request.params);
+      if (!p.success) return reply.code(400).send({ error: "bad_id" });
+      const target = await UserModel.findById(p.data.id);
+      if (!target || target.role !== "seller") {
+        return reply.code(400).send({ error: "seller_only" });
+      }
+      if (!target.stripeSubscriptionId) {
+        return reply.code(400).send({ error: "no_subscription" });
+      }
+      const stripe = getStripe(cfg);
+      if (!stripe) return reply.code(503).send({ error: "stripe_not_configured" });
+      try {
+        const sub = await stripe.subscriptions.update(target.stripeSubscriptionId, {
+          cancel_at_period_end: true,
+        });
+        target.subscriptionCancelAtPeriodEnd = Boolean(sub.cancel_at_period_end);
+        target.subscriptionCurrentPeriodEnd = sub.current_period_end
+          ? new Date(sub.current_period_end * 1000)
+          : null;
+        await target.save();
+        return {
+          ok: true,
+          currentPeriodEnd: target.subscriptionCurrentPeriodEnd?.toISOString() ?? null,
+        };
+      } catch (err) {
+        request.log.error({ err }, "admin_cancel_subscription_failed");
+        return reply.code(502).send({ error: "stripe_failed" });
+      }
+    }
+  );
 }

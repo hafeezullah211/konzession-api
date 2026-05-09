@@ -92,6 +92,39 @@ export async function registerBillingRoutes(fastify: FastifyInstance, cfg: Confi
 
     return { url: session.url, sessionId: session.id };
   });
+
+  /** Stops renewal after the current billing period; access stays until that date (Stripe mirrors to webhooks). */
+  fastify.post("/billing/seller-subscription/cancel", { preHandler: sellerOnly }, async (request, reply) => {
+    const stripe = getStripe(cfg);
+    if (!stripe) {
+      return reply.code(503).send({ error: "stripe_not_configured" });
+    }
+    const user = await UserModel.findById(request.authUser!.id);
+    if (!user || user.role !== "seller") return reply.code(403).send({ error: "forbidden" });
+    if (!user.stripeSubscriptionId) {
+      return reply.code(400).send({ error: "no_active_subscription" });
+    }
+
+    try {
+      const sub = await stripe.subscriptions.update(user.stripeSubscriptionId, {
+        cancel_at_period_end: true,
+      });
+      user.subscriptionCancelAtPeriodEnd = Boolean(sub.cancel_at_period_end);
+      user.subscriptionCurrentPeriodEnd = sub.current_period_end
+        ? new Date(sub.current_period_end * 1000)
+        : null;
+      await user.save();
+
+      return {
+        ok: true,
+        cancelAtPeriodEnd: user.subscriptionCancelAtPeriodEnd,
+        currentPeriodEnd: user.subscriptionCurrentPeriodEnd?.toISOString() ?? null,
+      };
+    } catch (err) {
+      request.log.error({ err }, "seller_subscription_cancel_failed");
+      return reply.code(502).send({ error: "stripe_cancel_failed" });
+    }
+  });
 }
 
 async function handleSellerCheckoutCompleted(
@@ -236,11 +269,17 @@ async function handleInvoicePaid(cfg: Config, invoice: Stripe.Invoice) {
 
 async function handleSubscriptionUpdated(sub: Stripe.Subscription) {
   const userId = sub.metadata?.userId;
-  if (!userId) return;
-  const user = await UserModel.findById(userId);
+  let user = userId ? await UserModel.findById(userId) : null;
+  if (!user && sub.id) {
+    user = await UserModel.findOne({ stripeSubscriptionId: sub.id });
+  }
   if (!user || user.role !== "seller") return;
 
   user.stripeSubscriptionId = sub.id;
+  user.subscriptionCancelAtPeriodEnd = Boolean(sub.cancel_at_period_end);
+  user.subscriptionCurrentPeriodEnd = sub.current_period_end
+    ? new Date(sub.current_period_end * 1000)
+    : null;
   if (sub.trial_end) {
     user.trialEndsAt = new Date(sub.trial_end * 1000);
   }
@@ -297,7 +336,8 @@ export async function handleStripeWebhook(
       await handleInvoicePaid(cfg, invoice);
       break;
     }
-    case "customer.subscription.updated": {
+    case "customer.subscription.updated":
+    case "customer.subscription.deleted": {
       const sub = event.data.object as Stripe.Subscription;
       await handleSubscriptionUpdated(sub);
       break;

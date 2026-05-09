@@ -150,24 +150,38 @@ export async function registerPublicRoutes(fastify: FastifyInstance, _cfg: Confi
     };
   });
 
-  /** Public marketing/teaser only — full profiles are opened only in the buyer workspace after POST /buyer/unlock. */
+  /**
+   * Public detail view — exposes the verified license metadata that mirrors what users
+   * already see in the search results plus the structured fields rendered on the
+   * detail page (GISA, authority, address summary, status). Sensitive contact
+   * details remain behind the buyer workspace unlock flow.
+   */
   fastify.get<{ Params: { slug: string } }>("/public/listings/by-slug/:slug", async (request, reply) => {
     const listing = await ListingModel.findOne({
       slug: request.params.slug,
       status: "approved",
-      active: true,
     }).lean();
 
     if (!listing) return reply.code(404).send({ error: "not_found" });
 
-    const teaser = {
+    const detail = {
       id: String(listing._id),
       slug: listing.slug,
       displayName: listing.companyName?.trim() || listing.tradeCategory,
       tradeCategory: listing.tradeCategory,
+      tradeCategoryDe: listing.tradeCategoryDe ?? null,
+      companyName: listing.companyName ?? null,
+      summary: listing.summary ?? null,
+      summaryDe: listing.summaryDe ?? null,
+      gisaNumber: listing.gisaNumber ?? null,
+      authority: listing.authority ?? null,
+      addressLine: listing.addressLine ?? null,
+      city: listing.city ?? null,
+      bundesland: listing.bundesland ?? null,
+      active: Boolean(listing.active),
     };
 
-    return { teaserOnly: true, ...teaser };
+    return { teaserOnly: false, listing: detail };
   });
 
   fastify.post("/public/contact", async (request, reply) => {

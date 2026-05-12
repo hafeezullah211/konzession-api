@@ -1,0 +1,89 @@
+# Backend API + MongoDB + MinIO. From this directory:
+#   docker compose up -d --build
+#
+# Copy .env.example to .env (JWT_SECRET, etc.). MONGODB_URI in .env is ignored for the API container:
+#   default: mongodb://mongo:27017/konzession (the `mongo` service below).
+# To use Mongo on the host instead, set in .env: DOCKER_MONGODB_URI=mongodb://host.docker.internal:27017/konzession
+#
+# MinIO from your PC: S3 API http://127.0.0.1:9010 — Console login http://127.0.0.1:9011 (not 9001; 9001 is inside the container).
+# The API overrides MINIO_* so it talks to the `minio` service on the compose network.
+#
+# `minio-init` enables anonymous download on bucket `konzession` so browsers can GET license images.
+# If the console shows PRIVATE / images 403: `docker compose run --rm minio-init` or `scripts/minio-public-download.sh`.
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin12345
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        echo "Waiting for MinIO..."
+        for i in $$(seq 1 60); do
+          if mc alias set local http://minio:9000 minioadmin minioadmin12345 2>/dev/null; then
+            if mc ls local >/dev/null 2>&1; then break; fi
+          fi
+          sleep 1
+        done
+        mc ls local >/dev/null 2>&1 || { echo "MinIO not reachable from minio-init"; exit 1; }
+        mc mb -p local/konzession 2>/dev/null || true
+        mc anonymous set download local/konzession
+        echo "MinIO bucket konzession: anonymous download enabled."
+    restart: "no"
+
+  api:
+    build: .
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    environment:
+      MONGODB_URI: ${DOCKER_MONGODB_URI:-mongodb://mongo:27017/konzession}
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: "9000"
+      MINIO_USE_SSL: "false"
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin12345
+      MINIO_BUCKET: konzession
+      MINIO_PUBLIC_BASE_URL: http://127.0.0.1:9010/konzession
+    depends_on:
+      mongo:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  mongo-data:
+  minio-data:

@@ -6,7 +6,6 @@ import { z } from "zod";
 import { authenticate } from "../auth-middleware.js";
 import type { Config } from "../config.js";
 import { hashPassword, verifyPassword } from "../lib/auth-hash.js";
-import { BUYER_CREDIT_UNIT_AMOUNT_CENTS } from "../lib/credit-pricing.js";
 import { createTransport, sendPasswordResetEmail } from "../lib/mail.js";
 import { getStripe } from "../lib/stripe-client.js";
 import {
@@ -28,7 +27,13 @@ const registerSellerBody = z
     phone: z.string().min(4),
     whatsapp: z.string().optional(),
     tradeType: z.string().min(1),
-    plan: z.enum(["basic", "vip"]),
+    /**
+     * Optional preferred plan recorded at signup. The user is created immediately on
+     * a free 2-month trial regardless of this value — no Stripe checkout is required
+     * to finish registration. The chosen plan is used later (post-trial) when the
+     * seller subscribes from the dashboard.
+     */
+    plan: z.enum(["basic", "vip"]).optional(),
   })
   .refine((d) => d.password === d.confirmPassword, {
     message: "passwords_mismatch",
@@ -44,7 +49,6 @@ const registerBuyerBody = z
     lastName: z.string().min(1),
     phone: z.string().min(4),
     whatsapp: z.string().optional(),
-    credits: z.number().int().min(1).max(500),
   })
   .refine((d) => d.password === d.confirmPassword, {
     message: "passwords_mismatch",
@@ -91,35 +95,16 @@ function refreshExpiryDate(cfg: Config) {
   return new Date(Date.now() + n * mult);
 }
 
-function sellerSubscriptionLineItem(
-  cfg: Config,
-  plan: "basic" | "vip"
-): import("stripe").Stripe.Checkout.SessionCreateParams.LineItem {
-  const priceId = plan === "vip" ? cfg.STRIPE_PRICE_VIP : cfg.STRIPE_PRICE_BASIC;
-  if (priceId) {
-    return { price: priceId, quantity: 1 };
-  }
-  const unitAmount =
-    plan === "vip"
-      ? cfg.STRIPE_SUBSCRIPTION_VIP_UNIT_AMOUNT_CENTS
-      : cfg.STRIPE_SUBSCRIPTION_BASIC_UNIT_AMOUNT_CENTS;
-  const euros = (unitAmount / 100).toFixed(0);
-  const name =
-    plan === "vip"
-      ? `Konzession VIP listing partner — €${euros}/mo after trial`
-      : `Konzession Basic listing partner — €${euros}/mo after trial`;
-  return {
-    price_data: {
-      currency: "eur",
-      unit_amount: unitAmount,
-      product_data: { name },
-      recurring: { interval: "month" },
-    },
-    quantity: 1,
-  };
-}
-
 export async function registerAuthRoutes(fastify: FastifyInstance, cfg: Config) {
+  /**
+   * Seller registration is now free of charge:
+   *   - The user account is always created immediately.
+   *   - `subscriptionStatus` is set to "trialing" with `trialEndsAt` ~2 months out.
+   *   - No Stripe Checkout session is opened during registration; the seller can
+   *     subscribe to Basic / VIP later via `/seller/checkout` once the trial nears
+   *     its end (or already during the trial if they want premium placement).
+   *   - `plan` is recorded as the preferred plan but is purely informational here.
+   */
   fastify.post("/auth/register/seller", async (request, reply) => {
     const parsed = registerSellerBody.safeParse(request.body);
     if (!parsed.success) {
@@ -129,76 +114,47 @@ export async function registerAuthRoutes(fastify: FastifyInstance, cfg: Config) 
     const exists = await UserModel.exists({ email: b.email.toLowerCase() });
     if (exists) return reply.code(409).send({ error: "email_taken" });
 
-    const stripeReady = Boolean(getStripe(cfg));
     const passwordHash = await hashPassword(b.password);
+    const trialEndsAt = new Date(
+      Date.now() + cfg.SELLER_TRIAL_PERIOD_DAYS * 86_400_000
+    );
 
-    if (!stripeReady) {
-      const user = await UserModel.create({
-        email: b.email.toLowerCase(),
-        passwordHash,
-        role: "seller",
-        firstName: b.firstName,
-        lastName: b.lastName,
-        phone: b.phone,
-        whatsapp: b.whatsapp ?? b.phone,
-        tradeType: b.tradeType,
-        displayName: `${b.firstName} ${b.lastName}`.trim(),
-        subscriptionPlan: b.plan,
-        subscriptionStatus: "trialing",
-        trialEndsAt: new Date(Date.now() + cfg.SELLER_TRIAL_PERIOD_DAYS * 86_400_000),
-      });
-
-      const access = signAccessToken(cfg, user);
-      const refresh = signRefreshToken(cfg, String(user._id));
-      await RefreshTokenModel.create({
-        token: refresh,
-        userId: user._id,
-        expiresAt: refreshExpiryDate(cfg),
-      });
-      return { accessToken: access, refreshToken: refresh, requiresCheckout: false };
-    }
-
-    const intent = await RegistrationIntentModel.create({
-      kind: "seller",
+    const user = await UserModel.create({
       email: b.email.toLowerCase(),
       passwordHash,
-      payload: {
-        firstName: b.firstName,
-        lastName: b.lastName,
-        phone: b.phone,
-        whatsapp: b.whatsapp ?? b.phone,
-        tradeType: b.tradeType,
-        plan: b.plan,
-      },
+      role: "seller",
+      firstName: b.firstName,
+      lastName: b.lastName,
+      phone: b.phone,
+      whatsapp: b.whatsapp ?? b.phone,
+      tradeType: b.tradeType,
+      displayName: `${b.firstName} ${b.lastName}`.trim(),
+      subscriptionPlan: b.plan ?? null,
+      subscriptionStatus: "trialing",
+      trialEndsAt,
     });
-    const stripe = getStripe(cfg)!;
-    const base = dashboardOrigin(cfg);
-    const successUrl = `${base}/register/seller/checkout/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${base}/register/seller`;
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer_email: b.email.toLowerCase(),
-      line_items: [sellerSubscriptionLineItem(cfg, b.plan)],
-      subscription_data: {
-        trial_period_days: cfg.SELLER_TRIAL_PERIOD_DAYS,
-      },
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      metadata: {
-        kind: "seller_registration",
-        intentId: String(intent._id),
-        plan: b.plan,
-      },
+
+    const access = signAccessToken(cfg, user);
+    const refresh = signRefreshToken(cfg, String(user._id));
+    await RefreshTokenModel.create({
+      token: refresh,
+      userId: user._id,
+      expiresAt: refreshExpiryDate(cfg),
     });
-    intent.stripeCheckoutSessionId = session.id;
-    await intent.save();
     return {
-      requiresCheckout: true,
-      checkoutUrl: session.url,
-      sessionId: session.id,
+      accessToken: access,
+      refreshToken: refresh,
+      requiresCheckout: false,
+      trialEndsAt: trialEndsAt.toISOString(),
     };
   });
 
+  /**
+   * Buyer registration is also free of charge:
+   *   - The user is created with `creditBalance: 0`.
+   *   - Credits are purchased later from `/buyer/purchase-credits` (Stripe), and only
+   *     when the buyer actually tries to unlock a license-holder profile.
+   */
   fastify.post("/auth/register/buyer", async (request, reply) => {
     const parsed = registerBuyerBody.safeParse(request.body);
     if (!parsed.success) {
@@ -208,74 +164,28 @@ export async function registerAuthRoutes(fastify: FastifyInstance, cfg: Config) 
     const exists = await UserModel.exists({ email: b.email.toLowerCase() });
     if (exists) return reply.code(409).send({ error: "email_taken" });
 
-    const stripeConfigured = Boolean(getStripe(cfg));
     const passwordHash = await hashPassword(b.password);
-
-    if (!stripeConfigured) {
-      const user = await UserModel.create({
-        email: b.email.toLowerCase(),
-        passwordHash,
-        role: "buyer",
-        firstName: b.firstName,
-        lastName: b.lastName,
-        phone: b.phone,
-        whatsapp: b.whatsapp ?? b.phone,
-        creditBalance: b.credits,
-      });
-      const access = signAccessToken(cfg, user);
-      const refresh = signRefreshToken(cfg, String(user._id));
-      await RefreshTokenModel.create({
-        token: refresh,
-        userId: user._id,
-        expiresAt: refreshExpiryDate(cfg),
-      });
-      return { accessToken: access, refreshToken: refresh, requiresCheckout: false };
-    }
-
-    const intent = await RegistrationIntentModel.create({
-      kind: "buyer",
+    const user = await UserModel.create({
       email: b.email.toLowerCase(),
       passwordHash,
-      payload: {
-        firstName: b.firstName,
-        lastName: b.lastName,
-        phone: b.phone,
-        whatsapp: b.whatsapp ?? b.phone,
-        credits: b.credits,
-      },
+      role: "buyer",
+      firstName: b.firstName,
+      lastName: b.lastName,
+      phone: b.phone,
+      whatsapp: b.whatsapp ?? b.phone,
+      creditBalance: 0,
     });
-    const stripe = getStripe(cfg)!;
-    const base = dashboardOrigin(cfg);
-    const successUrl = `${base}/register/buyer/checkout/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${base}/register/buyer`;
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      currency: "eur",
-      customer_email: b.email.toLowerCase(),
-      line_items: [
-        {
-          price_data: {
-            currency: "eur",
-            unit_amount: BUYER_CREDIT_UNIT_AMOUNT_CENTS,
-            product_data: { name: `Konzession profile credits — €5 each (×${b.credits})` },
-          },
-          quantity: b.credits,
-        },
-      ],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      metadata: {
-        kind: "buyer_registration",
-        intentId: String(intent._id),
-        credits: String(b.credits),
-      },
+    const access = signAccessToken(cfg, user);
+    const refresh = signRefreshToken(cfg, String(user._id));
+    await RefreshTokenModel.create({
+      token: refresh,
+      userId: user._id,
+      expiresAt: refreshExpiryDate(cfg),
     });
-    intent.stripeCheckoutSessionId = session.id;
-    await intent.save();
     return {
-      requiresCheckout: true,
-      checkoutUrl: session.url,
-      sessionId: session.id,
+      accessToken: access,
+      refreshToken: refresh,
+      requiresCheckout: false,
     };
   });
 

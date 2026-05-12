@@ -1,10 +1,18 @@
+import multipart from "@fastify/multipart";
 import type { FastifyInstance } from "fastify";
 import { Types } from "mongoose";
 import { z } from "zod";
 
 import type { Config } from "../config.js";
 import { authenticate } from "../auth-middleware.js";
+import { austriaBundeslandEnum } from "../lib/austria-bundeslaender.js";
+import {
+  createLicenseImageUploader,
+  licenseImageExtension,
+  normalizeLicenseImageUrlForBrowser,
+} from "../lib/minio-license.js";
 import { parsePageLimitQuery, totalPages } from "../lib/pagination.js";
+import { evaluateSellerAccess } from "../lib/seller-access.js";
 import { sellerMonthlyAmountCents } from "../lib/seller-plan-amount.js";
 import { uniqueSlug } from "../lib/slug.js";
 import { InquiryModel } from "../models/Inquiry.js";
@@ -13,16 +21,17 @@ import { ListingModel } from "../models/Listing.js";
 import { UserModel } from "../models/User.js";
 
 const createListingBody = z.object({
-  tradeCategory: z.string().min(1),
-  tradeCategoryDe: z.string().optional(),
-  companyName: z.string().optional(),
-  summary: z.string().optional(),
-  summaryDe: z.string().optional(),
-  gisaNumber: z.string().optional(),
-  authority: z.string().optional(),
-  addressLine: z.string().optional(),
-  city: z.string().optional(),
-  bundesland: z.string().optional(),
+  tradeCategory: z.string().trim().min(1),
+  tradeCategoryDe: z.string().trim().optional(),
+  companyName: z.string().trim().min(1),
+  summary: z.string().trim().min(1),
+  summaryDe: z.string().trim().optional(),
+  gisaNumber: z.string().trim().min(1),
+  authority: z.string().trim().min(1),
+  addressLine: z.string().trim().min(1),
+  city: z.string().trim().min(1),
+  bundesland: austriaBundeslandEnum,
+  licenseImageUrl: z.string().url().refine((u) => /^https?:\/\//i.test(u), { message: "http_url" }),
 });
 
 function escapeRegex(value: string): string {
@@ -40,6 +49,9 @@ function parseSellerListingsQuery(qs: Record<string, unknown>) {
 }
 
 export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config) {
+  await fastify.register(multipart, { limits: { fileSize: 5 * 1024 * 1024 } });
+  const licenseUploader = createLicenseImageUploader(cfg);
+
   const sellerOnly = async (request: import("fastify").FastifyRequest, reply: import("fastify").FastifyReply) =>
     authenticate(cfg, request, reply, ["seller"]);
 
@@ -172,12 +184,69 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
     };
   });
 
+  fastify.post("/seller/listings/license-image", { preHandler: sellerOnly }, async (request, reply) => {
+    if (!licenseUploader) {
+      return reply.code(503).send({ error: "minio_not_configured" });
+    }
+    const sellerId = request.authUser!.id;
+    const seller = await UserModel.findById(sellerId)
+      .select("role subscriptionStatus trialEndsAt accountBlocked")
+      .lean();
+    if (!seller) return reply.code(401).send({ error: "invalid_user" });
+    const access = evaluateSellerAccess(seller);
+    if (!access.allowed) {
+      return reply.code(402).send({
+        error: "subscription_required",
+        reason: access.reason,
+        trialEndsAt: access.trialEndsAt ? access.trialEndsAt.toISOString() : null,
+        daysLeftInTrial: access.daysLeftInTrial,
+      });
+    }
+    const file = await request.file();
+    if (!file) {
+      return reply.code(400).send({ error: "file_required" });
+    }
+    const ext = licenseImageExtension(file.mimetype);
+    if (!ext) {
+      return reply.code(400).send({ error: "invalid_image_type" });
+    }
+    const buffer = await file.toBuffer();
+    if (!buffer.length) {
+      return reply.code(400).send({ error: "empty_file" });
+    }
+    try {
+      const { publicUrl } = await licenseUploader.upload({
+        sellerId,
+        buffer,
+        contentType: file.mimetype,
+        extension: ext,
+      });
+      return { url: publicUrl };
+    } catch (err) {
+      request.log.error({ err }, "[seller] license-image upload failed");
+      return reply.code(500).send({ error: "upload_failed" });
+    }
+  });
+
   fastify.post("/seller/listings", { preHandler: sellerOnly }, async (request, reply) => {
     const parsed = createListingBody.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: "validation", details: parsed.error.flatten() });
     }
     const sellerId = request.authUser!.id;
+    const seller = await UserModel.findById(sellerId)
+      .select("role subscriptionStatus trialEndsAt accountBlocked")
+      .lean();
+    if (!seller) return reply.code(401).send({ error: "invalid_user" });
+    const access = evaluateSellerAccess(seller);
+    if (!access.allowed) {
+      return reply.code(402).send({
+        error: "subscription_required",
+        reason: access.reason,
+        trialEndsAt: access.trialEndsAt ? access.trialEndsAt.toISOString() : null,
+        daysLeftInTrial: access.daysLeftInTrial,
+      });
+    }
     const base =
       parsed.data.companyName?.trim()?.replace(/\s+/g, "-") ||
       parsed.data.tradeCategory.replace(/\s+/g, "-");
@@ -187,17 +256,41 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
       slug,
       status: "pending",
       tradeCategory: parsed.data.tradeCategory,
-      tradeCategoryDe: parsed.data.tradeCategoryDe,
+      tradeCategoryDe: parsed.data.tradeCategoryDe?.trim() || undefined,
       companyName: parsed.data.companyName,
       summary: parsed.data.summary,
-      summaryDe: parsed.data.summaryDe,
+      summaryDe: parsed.data.summaryDe?.trim() || undefined,
       gisaNumber: parsed.data.gisaNumber,
       authority: parsed.data.authority,
       addressLine: parsed.data.addressLine,
       city: parsed.data.city,
       bundesland: parsed.data.bundesland,
+      licenseImageUrl: parsed.data.licenseImageUrl,
     });
     return { id: String(doc._id), slug: doc.slug, status: doc.status };
+  });
+
+  /**
+   * Lightweight read-only endpoint the seller dashboard polls to render the
+   * trial banner, paywall state, and to gate the "Add listing" / "Inquiries"
+   * UI without having to hit a write endpoint first.
+   */
+  fastify.get("/seller/access", { preHandler: sellerOnly }, async (request, reply) => {
+    const sellerId = request.authUser!.id;
+    const seller = await UserModel.findById(sellerId)
+      .select("role subscriptionStatus subscriptionPlan trialEndsAt accountBlocked")
+      .lean();
+    if (!seller) return reply.code(401).send({ error: "invalid_user" });
+    const access = evaluateSellerAccess(seller);
+    return {
+      allowed: access.allowed,
+      reason: access.reason,
+      subscriptionStatus: seller.subscriptionStatus ?? "none",
+      subscriptionPlan: seller.subscriptionPlan ?? null,
+      trialEndsAt: access.trialEndsAt ? access.trialEndsAt.toISOString() : null,
+      daysLeftInTrial: access.daysLeftInTrial,
+      trialPeriodDays: cfg.SELLER_TRIAL_PERIOD_DAYS,
+    };
   });
 
   fastify.get("/seller/listings", { preHandler: sellerOnly }, async (request) => {
@@ -244,6 +337,7 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
         addressLine: l.addressLine,
         city: l.city,
         bundesland: l.bundesland,
+        licenseImageUrl: normalizeLicenseImageUrlForBrowser(cfg, l.licenseImageUrl),
         adminNote: l.adminNote,
         createdAt: l.createdAt,
         updatedAt: l.updatedAt,

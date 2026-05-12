@@ -2,13 +2,33 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
 import type { Config } from "../config.js";
+import { evaluateSellerAccess } from "../lib/seller-access.js";
 import { ContactSubmissionModel } from "../models/ContactSubmission.js";
 import { ListingModel } from "../models/Listing.js";
 import { UserModel } from "../models/User.js";
+import { normalizeLicenseImageUrlForBrowser } from "../lib/minio-license.js";
 import { sortListingsForPublic } from "../lib/ranking.js";
 import type { ListingDoc } from "../models/Listing.js";
 import type { UserDoc } from "../models/User.js";
 import type { HydratedDocument } from "mongoose";
+
+import { austriaBundeslandEnum } from "../lib/austria-bundeslaender.js";
+
+/**
+ * Sellers whose listing-partner subscription is dormant (trial expired without
+ * a Basic/VIP subscription, past_due, canceled, or admin-blocked) should not
+ * surface on the public landing/search anymore — buyers should not be led to
+ * profiles whose owners cannot currently receive inquiries.
+ */
+function buildAllowedSellerIdSet(
+  sellerMap: Map<string, HydratedDocument<UserDoc>>
+): Set<string> {
+  const allowed = new Set<string>();
+  for (const [id, seller] of sellerMap.entries()) {
+    if (evaluateSellerAccess(seller).allowed) allowed.add(id);
+  }
+  return allowed;
+}
 
 const contactBody = z.object({
   name: z.string().min(1),
@@ -18,21 +38,9 @@ const contactBody = z.object({
   tradeCategory: z.string().min(1),
 });
 
-const bundeslandEnum = z.enum([
-  "Wien",
-  "Niederösterreich",
-  "Oberösterreich",
-  "Steiermark",
-  "Tirol",
-  "Kärnten",
-  "Salzburg",
-  "Vorarlberg",
-  "Burgenland",
-]);
-
 const publicListingsSearchQuery = z.object({
   /** Required filter: `all` or a federal state (must be sent explicitly). */
-  state: z.union([z.literal("all"), bundeslandEnum]),
+  state: z.union([z.literal("all"), austriaBundeslandEnum]),
   q: z
     .string()
     .max(200)
@@ -52,7 +60,7 @@ function firstQueryString(v: unknown): string | undefined {
   return undefined;
 }
 
-export async function registerPublicRoutes(fastify: FastifyInstance, _cfg: Config) {
+export async function registerPublicRoutes(fastify: FastifyInstance, cfg: Config) {
   fastify.get("/health", async () => ({ ok: true }));
 
   fastify.get("/public/listings", async () => {
@@ -62,9 +70,11 @@ export async function registerPublicRoutes(fastify: FastifyInstance, _cfg: Confi
     const sellerMap = new Map<string, HydratedDocument<UserDoc>>(
       sellers.map((s) => [String(s._id), s as HydratedDocument<UserDoc>])
     );
+    const allowedSellerIds = buildAllowedSellerIdSet(sellerMap);
+    const visible = approved.filter((l) => allowedSellerIds.has(String(l.sellerId)));
 
     const sorted = sortListingsForPublic(
-      approved as HydratedDocument<ListingDoc>[],
+      visible as HydratedDocument<ListingDoc>[],
       sellerMap
     );
 
@@ -77,6 +87,7 @@ export async function registerPublicRoutes(fastify: FastifyInstance, _cfg: Confi
         tradeCategoryDe: l.tradeCategoryDe ?? null,
         city: l.city ?? null,
         bundesland: l.bundesland ?? null,
+        licenseImageUrl: normalizeLicenseImageUrlForBrowser(cfg, l.licenseImageUrl),
       })),
     };
   });
@@ -121,9 +132,11 @@ export async function registerPublicRoutes(fastify: FastifyInstance, _cfg: Confi
     const sellerMap = new Map<string, HydratedDocument<UserDoc>>(
       sellers.map((s) => [String(s._id), s as HydratedDocument<UserDoc>])
     );
+    const allowedSellerIds = buildAllowedSellerIdSet(sellerMap);
+    const visible = approved.filter((l) => allowedSellerIds.has(String(l.sellerId)));
 
     const sorted = sortListingsForPublic(
-      approved as HydratedDocument<ListingDoc>[],
+      visible as HydratedDocument<ListingDoc>[],
       sellerMap
     );
 
@@ -142,6 +155,7 @@ export async function registerPublicRoutes(fastify: FastifyInstance, _cfg: Confi
         tradeCategoryDe: l.tradeCategoryDe ?? null,
         city: l.city ?? null,
         bundesland: l.bundesland ?? null,
+        licenseImageUrl: normalizeLicenseImageUrlForBrowser(cfg, l.licenseImageUrl),
       })),
       total,
       page: safePage,
@@ -179,6 +193,7 @@ export async function registerPublicRoutes(fastify: FastifyInstance, _cfg: Confi
       city: listing.city ?? null,
       bundesland: listing.bundesland ?? null,
       active: Boolean(listing.active),
+      licenseImageUrl: normalizeLicenseImageUrlForBrowser(cfg, listing.licenseImageUrl),
     };
 
     return { teaserOnly: false, listing: detail };

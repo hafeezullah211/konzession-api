@@ -14,6 +14,8 @@ const listingSchema = new Schema(
     addressLine: { type: String, trim: true },
     city: { type: String, trim: true },
     bundesland: { type: String, trim: true },
+    /** Public URL of the uploaded trade license image (MinIO / CDN). */
+    licenseImageUrl: { type: String, trim: true },
     status: {
       type: String,
       enum: ["pending", "approved", "rejected"],

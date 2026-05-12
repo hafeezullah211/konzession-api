@@ -6,6 +6,7 @@ import type { Config } from "../config.js";
 import { authenticate } from "../auth-middleware.js";
 import { createBuyerCreditsCheckoutSession } from "../lib/buyer-credits-checkout.js";
 import { fulfillBuyerCreditsFromCheckoutSession } from "../lib/fulfill-buyer-credits.js";
+import { evaluateSellerAccess } from "../lib/seller-access.js";
 import { getStripe } from "../lib/stripe-client.js";
 import { createTransport, sendSellerInquiryNotification } from "../lib/mail.js";
 import { InquiryModel } from "../models/Inquiry.js";
@@ -19,6 +20,8 @@ import {
 } from "../lib/platform-settings.js";
 import { UnlockEventModel } from "../models/UnlockEvent.js";
 import { formatInquiryAddressLine } from "../lib/inquiry-address.js";
+import { normalizeLicenseImageUrlForBrowser } from "../lib/minio-license.js";
+import { AUSTRIA_BUNDESLAENDER } from "../lib/austria-bundeslaender.js";
 
 const creditsCheckoutBody = z.object({
   credits: z.number().int().min(1).max(500),
@@ -33,19 +36,6 @@ const fulfillSessionBody = z.object({
 const objectIdString = z.string().refine((s) => Types.ObjectId.isValid(s), {
   message: "invalid_object_id",
 });
-
-/** Same federal-state set used by the public listings search. */
-const BUYER_DIRECTORY_BUNDESLAND = [
-  "Wien",
-  "Niederösterreich",
-  "Oberösterreich",
-  "Steiermark",
-  "Tirol",
-  "Kärnten",
-  "Salzburg",
-  "Vorarlberg",
-  "Burgenland",
-] as const;
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -70,7 +60,7 @@ function buildDirectoryListingFilter(
 
   const stateRaw = firstQueryString(qs.state) ?? "all";
   const state =
-    stateRaw === "all" || (BUYER_DIRECTORY_BUNDESLAND as readonly string[]).includes(stateRaw)
+    stateRaw === "all" || (AUSTRIA_BUNDESLAENDER as readonly string[]).includes(stateRaw)
       ? stateRaw
       : "all";
   if (state !== "all") {
@@ -140,6 +130,7 @@ const inquiryBody = z.object({
  * specific listing.
  */
 function listingToTeaser(
+  cfg: Config,
   l: {
     _id: Types.ObjectId;
     slug: string;
@@ -153,12 +144,14 @@ function listingToTeaser(
     addressLine?: string | null;
     city?: string | null;
     bundesland?: string | null;
+    licenseImageUrl?: string | null;
     sellerId: Types.ObjectId;
   },
   unlockedListingIds: Set<string>
 ) {
   const id = String(l._id);
   const unlocked = unlockedListingIds.has(id);
+  const licenseImageUrl = normalizeLicenseImageUrlForBrowser(cfg, l.licenseImageUrl);
   const base = {
     id,
     slug: l.slug,
@@ -166,6 +159,7 @@ function listingToTeaser(
     tradeCategoryDe: l.tradeCategoryDe ?? null,
     sellerId: String(l.sellerId),
     unlocked,
+    licenseImageUrl,
   };
 
   if (!unlocked) {
@@ -339,7 +333,7 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
         .skip(teaserPL.skip)
         .limit(teaserPL.limit)
         .lean();
-      teaserListings = slice.map((l) => listingToTeaser(l, unlockedListingIds));
+      teaserListings = slice.map((l) => listingToTeaser(cfg, l, unlockedListingIds));
     }
 
     if (!skipInvoices) {
@@ -412,7 +406,7 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       teaserTotalPages: totalPages(teaserTotal, teaserPL.limit),
       teaserQ,
       teaserState,
-      teaserBundeslaender: BUYER_DIRECTORY_BUNDESLAND,
+      teaserBundeslaender: [...AUSTRIA_BUNDESLAENDER],
       invoices: invoicesOut,
       invoicesTotal,
       invoicesPage: invoicePL.page,
@@ -602,6 +596,29 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       listingId,
     });
     if (!unlocked) return reply.code(403).send({ error: "unlock_required" });
+
+    /**
+     * Block delivery if the seller's listing-partner subscription has lapsed:
+     *   - During the seller's free 2-month trial (status === "trialing" and
+     *     `trialEndsAt` in the future) inquiries flow normally.
+     *   - After the trial without an active Basic/VIP subscription, the seller
+     *     is in "trial_expired" / "no_subscription" — inquiries are rejected so
+     *     the buyer is not led to expect a response. The buyer sees a generic
+     *     "currently unavailable" message.
+     */
+    const sellerDoc = await UserModel.findById(b.sellerId)
+      .select("role subscriptionStatus trialEndsAt accountBlocked")
+      .lean();
+    if (!sellerDoc) {
+      return reply.code(404).send({ error: "seller_not_found" });
+    }
+    const sellerAccess = evaluateSellerAccess(sellerDoc);
+    if (!sellerAccess.allowed) {
+      return reply.code(403).send({
+        error: "seller_unavailable",
+        reason: sellerAccess.reason,
+      });
+    }
 
     const locationDisplay = formatInquiryAddressLine({
       houseNumber: b.houseNumber,

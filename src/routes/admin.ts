@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { Config } from "../config.js";
 import { authenticate } from "../auth-middleware.js";
 import { getStripe } from "../lib/stripe-client.js";
+import { normalizeLicenseImageUrlForBrowser } from "../lib/minio-license.js";
 import { parsePageLimitQuery, totalPages } from "../lib/pagination.js";
 import {
   isSellerProfileUnlockingEnabled,
@@ -194,6 +195,7 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
         addressLine: l.addressLine,
         city: l.city,
         bundesland: l.bundesland,
+        licenseImageUrl: normalizeLicenseImageUrlForBrowser(cfg, l.licenseImageUrl),
         adminNote: l.adminNote,
         createdAt: l.createdAt,
         updatedAt: l.updatedAt,

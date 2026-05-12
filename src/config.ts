@@ -45,6 +45,18 @@ const envSchema = z.object({
   CHECKOUT_CANCEL_URL: z.string().optional(),
   /** Base URL of the dashboard app (password reset links). Default: http://localhost:3001 */
   DASHBOARD_ORIGIN: z.string().url().optional(),
+  /** MinIO / S3-compatible host (hostname only, no scheme). */
+  MINIO_ENDPOINT: z.string().min(1).optional(),
+  MINIO_PORT: z.coerce.number().int().positive().optional(),
+  MINIO_USE_SSL: z
+    .union([z.literal("true"), z.literal("false")])
+    .optional()
+    .transform((v) => v === "true"),
+  MINIO_ACCESS_KEY: z.string().optional(),
+  MINIO_SECRET_KEY: z.string().optional(),
+  MINIO_BUCKET: z.string().optional(),
+  /** Public browser base for objects, e.g. `https://cdn.example.com/my-bucket` (no trailing slash). */
+  MINIO_PUBLIC_BASE_URL: z.string().url().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;

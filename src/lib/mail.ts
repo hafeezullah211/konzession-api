@@ -8,6 +8,17 @@
 import nodemailer from "nodemailer";
 import type { Config } from "../config.js";
 
+/** Nodemailer defaults wait up to ~2 min for TCP; Railway Edge often 502s first (~60s). Keep under proxy limits. */
+const SMTP_CONNECT_MS = 20_000;
+const SMTP_DNS_MS = 12_000;
+const SMTP_SOCKET_MS = 45_000;
+
+function smtpClientName(cfg: Config): string | undefined {
+  const fromUser = cfg.SMTP_USER?.includes("@") ? cfg.SMTP_USER.split("@")[1]?.trim() : undefined;
+  if (fromUser) return fromUser;
+  return cfg.SMTP_HOST?.trim() || undefined;
+}
+
 export function createTransport(cfg: Config) {
   if (!cfg.SMTP_HOST || !cfg.SMTP_PORT || !cfg.SMTP_FROM) return null;
 
@@ -21,12 +32,18 @@ export function createTransport(cfg: Config) {
     port,
     secure,
     requireTLS,
+    connectionTimeout: SMTP_CONNECT_MS,
+    greetingTimeout: SMTP_CONNECT_MS,
+    socketTimeout: SMTP_SOCKET_MS,
+    dnsTimeout: SMTP_DNS_MS,
+    name: smtpClientName(cfg),
     auth:
       cfg.SMTP_USER && cfg.SMTP_PASSWORD
         ? { user: cfg.SMTP_USER, pass: cfg.SMTP_PASSWORD }
         : undefined,
     tls: {
       rejectUnauthorized: cfg.SMTP_TLS_REJECT_UNAUTHORIZED !== false,
+      servername: cfg.SMTP_HOST,
     },
   });
 }

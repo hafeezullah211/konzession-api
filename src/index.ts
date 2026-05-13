@@ -34,6 +34,20 @@ process.on("uncaughtException", (err) => {
 async function main() {
   const cfg = loadConfig();
 
+  const smtpVarsOk = Boolean(
+    cfg.SMTP_HOST &&
+      cfg.SMTP_PORT &&
+      cfg.SMTP_FROM &&
+      cfg.SMTP_USER &&
+      cfg.SMTP_PASSWORD
+  );
+  if (!smtpVarsOk) {
+    console.warn(
+      "[startup] Outbound email disabled or incomplete: set SMTP_HOST, SMTP_PORT, SMTP_FROM, SMTP_USER, and SMTP_PASSWORD. " +
+        "Forgot-password still returns reset_email_sent but will not send until these are set (see logs for password_reset_link)."
+    );
+  }
+
   try {
     await connectDb(cfg.MONGODB_URI);
   } catch (err) {

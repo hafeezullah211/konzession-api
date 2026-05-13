@@ -1,5 +1,34 @@
 import { z } from "zod";
 
+/**
+ * MinIO expects `endPoint` as hostname only (no scheme, no path).
+ * Accepts values like `127.0.0.1`, `minio`, `https://minio.example.com:9000`.
+ */
+export function parseMinioEndpoint(raw: string): { host: string; portFromUrl?: number } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { host: "" };
+
+  let toParse = trimmed;
+  if (!/^https?:\/\//i.test(toParse)) {
+    toParse = `http://${toParse}`;
+  }
+  try {
+    const u = new URL(toParse);
+    const portFromUrl = u.port ? Number.parseInt(u.port, 10) : undefined;
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    return { host, portFromUrl: Number.isFinite(portFromUrl) ? portFromUrl : undefined };
+  } catch {
+    const noScheme = trimmed.replace(/^https?:\/\//i, "");
+    const [hostPort] = noScheme.split("/");
+    const [h, p] = hostPort.split(":");
+    const portFromUrl = p ? Number.parseInt(p, 10) : undefined;
+    return {
+      host: h.replace(/^\[|\]$/g, ""),
+      portFromUrl: Number.isFinite(portFromUrl) ? portFromUrl : undefined,
+    };
+  }
+}
+
 const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
@@ -45,7 +74,7 @@ const envSchema = z.object({
   CHECKOUT_CANCEL_URL: z.string().optional(),
   /** Base URL of the dashboard app (password reset links). Default: http://localhost:3001 */
   DASHBOARD_ORIGIN: z.string().url().optional(),
-  /** MinIO / S3-compatible host (hostname only, no scheme). */
+  /** MinIO / S3-compatible host (hostname only preferred; URLs and host:port are normalized in loadConfig). */
   MINIO_ENDPOINT: z.string().min(1).optional(),
   MINIO_PORT: z.coerce.number().int().positive().optional(),
   MINIO_USE_SSL: z
@@ -54,7 +83,10 @@ const envSchema = z.object({
     .transform((v) => v === "true"),
   MINIO_ACCESS_KEY: z.string().optional(),
   MINIO_SECRET_KEY: z.string().optional(),
+  /** Bucket name. Alias: set `MINIO_BUCKET_NAME` instead (read in loadConfig for Railway templates). */
   MINIO_BUCKET: z.string().optional(),
+  /** Region for MinIO client and makeBucket. */
+  MINIO_REGION: z.string().min(1).default("us-east-1"),
   /** Public browser base for objects, e.g. `https://cdn.example.com/my-bucket` (no trailing slash). */
   MINIO_PUBLIC_BASE_URL: z.string().url().optional(),
 });
@@ -67,5 +99,24 @@ export function loadConfig(): Config {
     console.error(parsed.error.flatten().fieldErrors);
     throw new Error("Invalid environment variables");
   }
-  return parsed.data;
+  const d = parsed.data;
+
+  const bucket =
+    d.MINIO_BUCKET?.trim() || process.env.MINIO_BUCKET_NAME?.trim() || undefined;
+
+  let minioEndpoint = d.MINIO_ENDPOINT?.trim() || undefined;
+  let minioPort = d.MINIO_PORT;
+  if (minioEndpoint) {
+    const { host, portFromUrl } = parseMinioEndpoint(minioEndpoint);
+    minioEndpoint = host || undefined;
+    minioPort = minioPort ?? portFromUrl;
+  }
+
+  return {
+    ...d,
+    MINIO_ENDPOINT: minioEndpoint,
+    MINIO_PORT: minioPort,
+    MINIO_BUCKET: bucket,
+    MINIO_REGION: d.MINIO_REGION.trim() || "us-east-1",
+  };
 }

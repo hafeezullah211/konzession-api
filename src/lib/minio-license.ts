@@ -111,12 +111,14 @@ export function createLicenseImageUploader(cfg: Config): LicenseImageUploader | 
   }
 
   const port = cfg.MINIO_PORT ?? (cfg.MINIO_USE_SSL ? 443 : 9000);
+  const region = cfg.MINIO_REGION.trim() || "us-east-1";
   const client = new Minio.Client({
     endPoint: cfg.MINIO_ENDPOINT,
     port,
     useSSL: Boolean(cfg.MINIO_USE_SSL),
     accessKey: cfg.MINIO_ACCESS_KEY,
     secretKey: cfg.MINIO_SECRET_KEY,
+    region,
   });
 
   const bucket = cfg.MINIO_BUCKET;
@@ -129,7 +131,7 @@ export function createLicenseImageUploader(cfg: Config): LicenseImageUploader | 
       const objectKey = `Licenses/${safeSeller}/${name}`;
       const exists = await client.bucketExists(bucket);
       if (!exists) {
-        await client.makeBucket(bucket, "us-east-1");
+        await client.makeBucket(bucket, region);
       }
       await client.putObject(bucket, objectKey, buffer, buffer.length, {
         "Content-Type": contentType,

@@ -40,7 +40,18 @@ export async function ensureUnlockEventIndexes(): Promise<void> {
 
     await UnlockEventModel.syncIndexes();
   } catch (err) {
-    // Swallow non-fatal — surface in logs upstream.
+    if (
+      err instanceof mongoose.mongo.MongoServerError &&
+      (err.code === 14031 || err.codeName === "OutOfDiskSpace")
+    ) {
+      console.error(
+        "[ensureUnlockEventIndexes] MongoDB reports insufficient free disk for index operations " +
+          "(typically needs ~500MB free). Fix: in Railway open the MongoDB service → increase the " +
+          "volume/plan or free space, then redeploy. The API will start but UnlockEvent indexes may be stale."
+      );
+      return;
+    }
+    // Swallow other non-fatal index races — surface in logs upstream.
     console.warn("ensureUnlockEventIndexes:", err);
   }
 }

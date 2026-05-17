@@ -19,6 +19,7 @@ import { registerPublicRoutes } from "./routes/public.js";
 import { registerSellerRoutes } from "./routes/seller.js";
 import { registerRequestLogging } from "./request-logging.js";
 import { seedAdminIfNeeded } from "./seed.js";
+import { createTransport } from "./lib/mail.js";
 
 /**
  * Surface late async failures (Mongo disconnect, SMTP, etc.) so Railway's logs
@@ -55,6 +56,37 @@ async function main() {
       "[startup] MongoDB connection failed. Verify MONGODB_URI and that the cluster's IP allowlist accepts requests from Railway (Atlas: Network Access → 0.0.0.0/0 or the Railway egress IPs).",
       err
     );
+    // ---- SMTP startup diagnostic ----------------------------------------------
+  // Logs whether the SiteGround SMTP connection actually works from this
+  // environment (Railway etc). If verify fails, /auth/forgot-password and
+  // inquiry notifications will fail too — the error code below tells us why.
+  if (smtpVarsOk) {
+    const smtpTransport = createTransport(cfg);
+    if (smtpTransport) {
+      smtpTransport
+        .verify()
+        .then(() =>
+          console.log(
+            `[SMTP] verify OK — connected to ${cfg.SMTP_HOST}:${cfg.SMTP_PORT} (secure=${cfg.SMTP_SECURE ?? cfg.SMTP_PORT === 465})`
+          )
+        )
+        .catch((err: NodeJS.ErrnoException) =>
+          console.error(
+            "[SMTP] verify FAILED:",
+            err.code ?? "NO_CODE",
+            "-",
+            err.message,
+            "\n  host:",
+            cfg.SMTP_HOST,
+            "port:",
+            cfg.SMTP_PORT,
+            "secure:",
+            cfg.SMTP_SECURE ?? cfg.SMTP_PORT === 465
+          )
+        );
+    }
+  }
+  // ---------------------------------------------------------------------------
     throw err;
   }
 

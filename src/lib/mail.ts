@@ -1,51 +1,66 @@
 /**
- * SMTP transport compatible with SiteGround and most hosts:
- * - Port 465 → implicit TLS (`secure: true`)
- * - Ports 587 / 2525 → STARTTLS (`requireTLS: true`, SiteGround recommends 587)
- *
- * Configure via SMTP_* environment variables (see `config.ts`).
+ * Email sender via Brevo HTTP API.
+ * Uses HTTPS port 443 - works on Railway (which blocks SMTP).
  */
-import nodemailer from "nodemailer";
 import type { Config } from "../config.js";
 
-/** Nodemailer defaults wait up to ~2 min for TCP; Railway Edge often 502s first (~60s). Keep under proxy limits. */
-const SMTP_CONNECT_MS = 20_000;
-const SMTP_DNS_MS = 12_000;
-const SMTP_SOCKET_MS = 45_000;
+const BREVO_ENDPOINT = "https://api.brevo.com/v3/smtp/email";
+const REQUEST_TIMEOUT_MS = 20_000;
 
-function smtpClientName(cfg: Config): string | undefined {
-  const fromUser = cfg.SMTP_USER?.includes("@") ? cfg.SMTP_USER.split("@")[1]?.trim() : undefined;
-  if (fromUser) return fromUser;
-  return cfg.SMTP_HOST?.trim() || undefined;
+type Transport = {
+  sendMail(opts: {
+    from: string;
+    to: string;
+    subject: string;
+    text?: string;
+    html?: string;
+  }): Promise<{ messageId: string }>;
+};
+
+/** RFC-style From header for Brevo and route callers. */
+export function formatEmailFrom(cfg: Config): string | null {
+  if (!cfg.EMAIL_FROM_ADDRESS) return null;
+  const name = cfg.EMAIL_FROM_NAME ?? "Konzession";
+  return `${name} <${cfg.EMAIL_FROM_ADDRESS}>`;
 }
 
-export function createTransport(cfg: Config) {
-  if (!cfg.SMTP_HOST || !cfg.SMTP_PORT || !cfg.SMTP_FROM) return null;
+export function createTransport(cfg: Config): Transport | null {
+  if (!cfg.BREVO_API_KEY || !cfg.EMAIL_FROM_ADDRESS) return null;
 
-  const port = cfg.SMTP_PORT;
-  const secure = cfg.SMTP_SECURE ?? port === 465;
-  const startTlsPorts = new Set([587, 2525]);
-  const requireTLS = !secure && startTlsPorts.has(port);
+  return {
+    async sendMail(opts) {
+      const fromMatch = opts.from.match(/^(.*?)\s*<(.+)>$/);
+      const senderName = fromMatch?.[1]?.trim() || cfg.EMAIL_FROM_NAME || "Konzession";
+      const senderEmail = fromMatch?.[2]?.trim() || cfg.EMAIL_FROM_ADDRESS!;
 
-  return nodemailer.createTransport({
-    host: cfg.SMTP_HOST,
-    port,
-    secure,
-    requireTLS,
-    connectionTimeout: SMTP_CONNECT_MS,
-    greetingTimeout: SMTP_CONNECT_MS,
-    socketTimeout: SMTP_SOCKET_MS,
-    dnsTimeout: SMTP_DNS_MS,
-    name: smtpClientName(cfg),
-    auth:
-      cfg.SMTP_USER && cfg.SMTP_PASSWORD
-        ? { user: cfg.SMTP_USER, pass: cfg.SMTP_PASSWORD }
-        : undefined,
-    tls: {
-      rejectUnauthorized: cfg.SMTP_TLS_REJECT_UNAUTHORIZED !== false,
-      servername: cfg.SMTP_HOST,
+      const body = {
+        sender: { name: senderName, email: senderEmail },
+        to: [{ email: opts.to }],
+        subject: opts.subject,
+        htmlContent: opts.html,
+        textContent: opts.text,
+      };
+
+      const res = await fetch(BREVO_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "api-key": cfg.BREVO_API_KEY!,
+          "Content-Type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`Brevo API ${res.status}: ${errText || res.statusText}`);
+      }
+
+      const data = (await res.json()) as { messageId?: string };
+      return { messageId: data.messageId ?? "unknown" };
     },
-  });
+  };
 }
 
 function escapeHtml(s: string): string {
@@ -56,7 +71,10 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
-/** Notify listing partner when a buyer submits an inquiry (SMTP required). */
+function escapeAttr(s: string): string {
+  return escapeHtml(s).replace(/'/g, "&#39;");
+}
+
 export async function sendSellerInquiryNotification(opts: {
   transport: NonNullable<ReturnType<typeof createTransport>>;
   from: string;
@@ -68,7 +86,6 @@ export async function sendSellerInquiryNotification(opts: {
     phone: string;
     whatsapp?: string;
     tradeInfo?: string;
-    /** Single formatted address line (structured fields or legacy label) */
     locationDisplay?: string;
     listingSlug?: string;
   };
@@ -100,17 +117,11 @@ export async function sendSellerInquiryNotification(opts: {
 <p><strong>Name:</strong> ${escapeHtml(name)}<br/>
 <strong>Email:</strong> ${escapeHtml(inquiry.email)}<br/>
 <strong>Phone:</strong> ${escapeHtml(inquiry.phone)}${
-      inquiry.whatsapp
-        ? `<br/><strong>WhatsApp:</strong> ${escapeHtml(inquiry.whatsapp)}`
-        : ""
+      inquiry.whatsapp ? `<br/><strong>WhatsApp:</strong> ${escapeHtml(inquiry.whatsapp)}` : ""
     }${
-      inquiry.locationDisplay
-        ? `<br/><strong>Location:</strong> ${escapeHtml(inquiry.locationDisplay)}`
-        : ""
+      inquiry.locationDisplay ? `<br/><strong>Location:</strong> ${escapeHtml(inquiry.locationDisplay)}` : ""
     }${
-      inquiry.listingSlug
-        ? `<br/><strong>Listing slug:</strong> ${escapeHtml(inquiry.listingSlug)}`
-        : ""
+      inquiry.listingSlug ? `<br/><strong>Listing slug:</strong> ${escapeHtml(inquiry.listingSlug)}` : ""
     }</p>${
       inquiry.tradeInfo
         ? `<p><strong>Message:</strong><br/>${escapeHtml(inquiry.tradeInfo).replace(/\n/g, "<br/>")}</p>`
@@ -124,7 +135,6 @@ export async function sendPasswordResetEmail(opts: {
   from: string;
   to: string;
   resetUrl: string;
-  /** Optional display name used to personalise the greeting ("Hi Jane,"). */
   recipientName?: string;
 }) {
   const { transport, from, to, resetUrl, recipientName } = opts;
@@ -139,66 +149,40 @@ export async function sendPasswordResetEmail(opts: {
     "",
     resetUrl,
     "",
-    "If you did not request a password reset you can safely ignore this email — your password will not change.",
+    "If you did not request a password reset you can safely ignore this email.",
     "",
     "— The Konzession team",
   ].join("\n");
 
   const safeUrl = escapeAttr(resetUrl);
   const html = `<!doctype html>
-<html>
-  <body style="margin:0;padding:0;background:#f6f7f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;color:#111;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f6f7f9;padding:32px 0;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
-            <tr>
-              <td style="padding:28px 32px;border-bottom:1px solid #f1f5f9;">
-                <div style="font-size:18px;font-weight:700;letter-spacing:-0.01em;color:#0f172a;">Konzession</div>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:28px 32px 8px 32px;">
-                <h1 style="margin:0 0 8px 0;font-size:20px;line-height:1.3;color:#0f172a;">Reset your password</h1>
-                <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:#334155;">${escapeHtml(greeting)}</p>
-                <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:#334155;">
-                  We received a request to reset the password for your Konzession account.
-                  Click the button below to choose a new password.
-                </p>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:0 32px 24px 32px;" align="left">
-                <a href="${safeUrl}" style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;font-weight:600;font-size:14px;padding:12px 22px;border-radius:8px;">
-                  Reset password
-                </a>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:0 32px 8px 32px;">
-                <p style="margin:0 0 8px 0;font-size:13px;line-height:1.6;color:#475569;">
-                  This link is valid for <strong>1 hour</strong>. After that you will need to request a new one.
-                </p>
-                <p style="margin:0 0 16px 0;font-size:12px;line-height:1.6;color:#64748b;word-break:break-all;">
-                  If the button does not work, copy and paste this URL into your browser:<br/>
-                  <a href="${safeUrl}" style="color:#2563eb;">${escapeHtml(resetUrl)}</a>
-                </p>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:16px 32px 28px 32px;border-top:1px solid #f1f5f9;">
-                <p style="margin:0;font-size:12px;line-height:1.6;color:#94a3b8;">
-                  If you did not request a password reset you can safely ignore this email — your password will not change.
-                </p>
-              </td>
-            </tr>
-          </table>
-          <p style="margin:16px 0 0 0;font-size:11px;color:#94a3b8;">© Konzession</p>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>`;
+<html><body style="margin:0;padding:0;background:#f6f7f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#111;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f6f7f9;padding:32px 0;">
+<tr><td align="center">
+<table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
+<tr><td style="padding:28px 32px;border-bottom:1px solid #f1f5f9;">
+<div style="font-size:18px;font-weight:700;color:#0f172a;">Konzession</div>
+</td></tr>
+<tr><td style="padding:28px 32px 8px 32px;">
+<h1 style="margin:0 0 8px 0;font-size:20px;color:#0f172a;">Reset your password</h1>
+<p style="margin:0 0 16px 0;font-size:14px;color:#334155;">${escapeHtml(greeting)}</p>
+<p style="margin:0 0 16px 0;font-size:14px;color:#334155;">We received a request to reset the password for your Konzession account. Click the button below to choose a new password.</p>
+</td></tr>
+<tr><td style="padding:0 32px 24px 32px;" align="left">
+<a href="${safeUrl}" style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;font-weight:600;font-size:14px;padding:12px 22px;border-radius:8px;">Reset password</a>
+</td></tr>
+<tr><td style="padding:0 32px 8px 32px;">
+<p style="margin:0 0 8px 0;font-size:13px;color:#475569;">This link is valid for <strong>1 hour</strong>.</p>
+<p style="margin:0;font-size:12px;color:#64748b;word-break:break-all;">If the button doesn't work, copy this URL into your browser:<br/><a href="${safeUrl}" style="color:#2563eb;">${escapeHtml(resetUrl)}</a></p>
+</td></tr>
+<tr><td style="padding:16px 32px 28px 32px;border-top:1px solid #f1f5f9;">
+<p style="margin:0;font-size:12px;color:#94a3b8;">If you did not request a password reset you can safely ignore this email — your password will not change.</p>
+</td></tr>
+</table>
+<p style="margin:16px 0 0 0;font-size:11px;color:#94a3b8;">© Konzession</p>
+</td></tr>
+</table>
+</body></html>`;
 
   await transport.sendMail({
     from,
@@ -207,8 +191,4 @@ export async function sendPasswordResetEmail(opts: {
     text,
     html,
   });
-}
-
-function escapeAttr(s: string): string {
-  return escapeHtml(s).replace(/'/g, "&#39;");
 }

@@ -70,6 +70,9 @@ const envSchema = z.object({
     .union([z.literal("true"), z.literal("false")])
     .optional()
     .transform((v) => v !== "false"),
+  BREVO_API_KEY: z.string().optional(),
+  EMAIL_FROM_ADDRESS: z.string().optional(),
+  EMAIL_FROM_NAME: z.string().optional(),
   CHECKOUT_SUCCESS_URL: z.string().optional(),
   CHECKOUT_CANCEL_URL: z.string().optional(),
   /** Base URL of the dashboard app (password reset links). Default: http://localhost:3001 */
@@ -114,6 +117,7 @@ export function loadConfig(): Config {
 
   return {
     ...d,
+    EMAIL_FROM_NAME: d.EMAIL_FROM_NAME ?? "Konzession",
     MINIO_ENDPOINT: minioEndpoint,
     MINIO_PORT: minioPort,
     MINIO_BUCKET: bucket,

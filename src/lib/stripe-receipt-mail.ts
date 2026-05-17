@@ -1,5 +1,5 @@
 import type { Config } from "../config.js";
-import { createTransport } from "./mail.js";
+import { createTransport, formatEmailFrom } from "./mail.js";
 
 export async function sendStripeReceiptEmail(
   cfg: Config,
@@ -12,7 +12,8 @@ export async function sendStripeReceiptEmail(
   }
 ): Promise<void> {
   const transport = createTransport(cfg);
-  if (!transport || !cfg.SMTP_FROM) return;
+  const from = formatEmailFrom(cfg);
+  if (!transport || !from) return;
 
   const bodyText = [
     ...opts.lines,
@@ -28,7 +29,7 @@ export async function sendStripeReceiptEmail(
     : "";
 
   await transport.sendMail({
-    from: cfg.SMTP_FROM,
+    from,
     to: opts.to,
     subject: opts.subject,
     text: bodyText,

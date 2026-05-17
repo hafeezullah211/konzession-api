@@ -6,7 +6,7 @@ import { z } from "zod";
 import { authenticate } from "../auth-middleware.js";
 import type { Config } from "../config.js";
 import { hashPassword, verifyPassword } from "../lib/auth-hash.js";
-import { createTransport, sendPasswordResetEmail } from "../lib/mail.js";
+import { createTransport, formatEmailFrom, sendPasswordResetEmail } from "../lib/mail.js";
 import { getStripe } from "../lib/stripe-client.js";
 import {
   signAccessToken,
@@ -391,11 +391,12 @@ export async function registerAuthRoutes(fastify: FastifyInstance, cfg: Config) 
     const origin = dashboardOrigin(cfg);
     const resetUrl = `${origin}/reset-password?token=${encodeURIComponent(token)}`;
     const transport = createTransport(cfg);
-    if (transport && cfg.SMTP_FROM) {
+    const from = formatEmailFrom(cfg);
+    if (transport && from) {
       try {
         await sendPasswordResetEmail({
           transport,
-          from: cfg.SMTP_FROM,
+          from,
           to: user.email,
           resetUrl,
           recipientName:
@@ -409,7 +410,7 @@ export async function registerAuthRoutes(fastify: FastifyInstance, cfg: Config) 
     } else {
       request.log.warn(
         { resetUrl, email: user.email },
-        "password_reset_link (configure SMTP to email users)"
+        "password_reset_link (configure BREVO_API_KEY and EMAIL_FROM_ADDRESS to email users)"
       );
     }
 

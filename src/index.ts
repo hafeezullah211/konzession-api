@@ -19,10 +19,9 @@ import { registerPublicRoutes } from "./routes/public.js";
 import { registerSellerRoutes } from "./routes/seller.js";
 import { registerRequestLogging } from "./request-logging.js";
 import { seedAdminIfNeeded } from "./seed.js";
-import { createTransport } from "./lib/mail.js";
 
 /**
- * Surface late async failures (Mongo disconnect, SMTP, etc.) so Railway's logs
+ * Surface late async failures (Mongo disconnect, email API, etc.) so Railway's logs
  * show the actual cause instead of silently 502-ing on the next request.
  */
 process.on("unhandledRejection", (reason) => {
@@ -35,17 +34,16 @@ process.on("uncaughtException", (err) => {
 async function main() {
   const cfg = loadConfig();
 
-  const smtpVarsOk = Boolean(
-    cfg.SMTP_HOST &&
-      cfg.SMTP_PORT &&
-      cfg.SMTP_FROM &&
-      cfg.SMTP_USER &&
-      cfg.SMTP_PASSWORD
-  );
-  if (!smtpVarsOk) {
+  const emailVarsOk = Boolean(cfg.BREVO_API_KEY && cfg.EMAIL_FROM_ADDRESS);
+  if (!emailVarsOk) {
     console.warn(
-      "[startup] Outbound email disabled or incomplete: set SMTP_HOST, SMTP_PORT, SMTP_FROM, SMTP_USER, and SMTP_PASSWORD. " +
-        "Forgot-password still returns reset_email_sent but will not send until these are set (see logs for password_reset_link)."
+      "[startup] Outbound email disabled: set BREVO_API_KEY and EMAIL_FROM_ADDRESS. " +
+        "Forgot-password still returns reset_email_sent but will not send until these are set."
+    );
+  } else if (cfg.BREVO_API_KEY!.startsWith("xsmtpsib-")) {
+    console.error(
+      "[startup] BREVO_API_KEY looks like an SMTP key (xsmtpsib-). " +
+        "Use a REST API key from Brevo → SMTP & API → API Keys (starts with xkeysib-)."
     );
   }
 
@@ -56,38 +54,25 @@ async function main() {
       "[startup] MongoDB connection failed. Verify MONGODB_URI and that the cluster's IP allowlist accepts requests from Railway (Atlas: Network Access → 0.0.0.0/0 or the Railway egress IPs).",
       err
     );
-    // ---- SMTP startup diagnostic ----------------------------------------------
-  // Logs whether the SiteGround SMTP connection actually works from this
-  // environment (Railway etc). If verify fails, /auth/forgot-password and
-  // inquiry notifications will fail too — the error code below tells us why.
-  if (smtpVarsOk) {
-    const smtpTransport = createTransport(cfg);
-    if (smtpTransport) {
-      smtpTransport
-        .verify()
-        .then(() =>
-          console.log(
-            `[SMTP] verify OK — connected to ${cfg.SMTP_HOST}:${cfg.SMTP_PORT} (secure=${cfg.SMTP_SECURE ?? cfg.SMTP_PORT === 465})`
-          )
-        )
-        .catch((err: NodeJS.ErrnoException) =>
-          console.error(
-            "[SMTP] verify FAILED:",
-            err.code ?? "NO_CODE",
-            "-",
-            err.message,
-            "\n  host:",
-            cfg.SMTP_HOST,
-            "port:",
-            cfg.SMTP_PORT,
-            "secure:",
-            cfg.SMTP_SECURE ?? cfg.SMTP_PORT === 465
-          )
-        );
-    }
-  }
-  // ---------------------------------------------------------------------------
     throw err;
+  }
+
+  if (emailVarsOk) {
+    fetch("https://api.brevo.com/v3/account", {
+      headers: {
+        "api-key": cfg.BREVO_API_KEY!,
+        accept: "application/json",
+      },
+    })
+      .then(async (res) => {
+        if (res.ok) {
+          const data = (await res.json()) as { email?: string };
+          console.log(`[BREVO] API key OK — account: ${data.email ?? "unknown"}`);
+        } else {
+          console.error(`[BREVO] API key check FAILED: ${res.status} ${res.statusText}`);
+        }
+      })
+      .catch((err: Error) => console.error("[BREVO] check ERROR:", err.message));
   }
 
   await ensureUnlockEventIndexes();

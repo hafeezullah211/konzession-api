@@ -8,7 +8,7 @@ import { createBuyerCreditsCheckoutSession } from "../lib/buyer-credits-checkout
 import { fulfillBuyerCreditsFromCheckoutSession } from "../lib/fulfill-buyer-credits.js";
 import { evaluateSellerAccess } from "../lib/seller-access.js";
 import { getStripe } from "../lib/stripe-client.js";
-import { createTransport, sendSellerInquiryNotification } from "../lib/mail.js";
+import { createTransport, formatEmailFrom, sendSellerInquiryNotification } from "../lib/mail.js";
 import { InquiryModel } from "../models/Inquiry.js";
 import { InvoiceModel } from "../models/Invoice.js";
 import { ListingModel } from "../models/Listing.js";
@@ -646,10 +646,11 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
     try {
       const seller = await UserModel.findById(b.sellerId).lean();
       const transport = createTransport(cfg);
-      if (transport && cfg.SMTP_FROM && seller?.email) {
+      const from = formatEmailFrom(cfg);
+      if (transport && from && seller?.email) {
         await sendSellerInquiryNotification({
           transport,
-          from: cfg.SMTP_FROM,
+          from,
           to: seller.email,
           inquiry: {
             firstName: b.firstName,

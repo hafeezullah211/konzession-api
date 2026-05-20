@@ -190,8 +190,6 @@ export async function registerAdminRoutes(fastify: FastifyInstance, cfg: Config)
         companyName: l.companyName,
         summary: l.summary,
         summaryDe: l.summaryDe,
-        gisaNumber: l.gisaNumber,
-        authority: l.authority,
         addressLine: l.addressLine,
         city: l.city,
         bundesland: l.bundesland,

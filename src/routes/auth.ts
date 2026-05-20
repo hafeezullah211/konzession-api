@@ -16,6 +16,7 @@ import {
 import { RefreshTokenModel } from "../models/RefreshToken.js";
 import { RegistrationIntentModel } from "../models/RegistrationIntent.js";
 import { UserModel } from "../models/User.js";
+import { isValidTradeCategory } from "../lib/trade-categories.js";
 
 const registerSellerBody = z
   .object({
@@ -26,7 +27,11 @@ const registerSellerBody = z
     lastName: z.string().min(1),
     phone: z.string().min(4),
     whatsapp: z.string().optional(),
-    tradeType: z.string().min(1),
+    tradeType: z
+      .string()
+      .trim()
+      .min(1)
+      .refine((v) => isValidTradeCategory(v), { message: "invalid_trade_category" }),
     /**
      * Optional preferred plan recorded at signup. The user is created immediately on
      * a free 2-month trial regardless of this value — no Stripe checkout is required

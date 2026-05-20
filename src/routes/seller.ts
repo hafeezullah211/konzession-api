@@ -15,19 +15,22 @@ import { parsePageLimitQuery, totalPages } from "../lib/pagination.js";
 import { evaluateSellerAccess } from "../lib/seller-access.js";
 import { sellerMonthlyAmountCents } from "../lib/seller-plan-amount.js";
 import { uniqueSlug } from "../lib/slug.js";
+import { isValidTradeCategory, tradeCategoryGroupForValue } from "../lib/trade-categories.js";
 import { InquiryModel } from "../models/Inquiry.js";
 import { InvoiceModel } from "../models/Invoice.js";
 import { ListingModel } from "../models/Listing.js";
 import { UserModel } from "../models/User.js";
 
 const createListingBody = z.object({
-  tradeCategory: z.string().trim().min(1),
+  tradeCategory: z
+    .string()
+    .trim()
+    .min(1)
+    .refine((v) => isValidTradeCategory(v), { message: "invalid_trade_category" }),
   tradeCategoryDe: z.string().trim().optional(),
   companyName: z.string().trim().min(1),
   summary: z.string().trim().min(1),
   summaryDe: z.string().trim().optional(),
-  gisaNumber: z.string().trim().min(1),
-  authority: z.string().trim().min(1),
   addressLine: z.string().trim().min(1),
   city: z.string().trim().min(1),
   bundesland: austriaBundeslandEnum,
@@ -256,12 +259,13 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
       slug,
       status: "pending",
       tradeCategory: parsed.data.tradeCategory,
-      tradeCategoryDe: parsed.data.tradeCategoryDe?.trim() || undefined,
+      tradeCategoryDe:
+        parsed.data.tradeCategoryDe?.trim() ||
+        tradeCategoryGroupForValue(parsed.data.tradeCategory)?.labelDe ||
+        undefined,
       companyName: parsed.data.companyName,
       summary: parsed.data.summary,
       summaryDe: parsed.data.summaryDe?.trim() || undefined,
-      gisaNumber: parsed.data.gisaNumber,
-      authority: parsed.data.authority,
       addressLine: parsed.data.addressLine,
       city: parsed.data.city,
       bundesland: parsed.data.bundesland,
@@ -308,8 +312,6 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
         { companyName: rx },
         { summary: rx },
         { summaryDe: rx },
-        { gisaNumber: rx },
-        { authority: rx },
         { addressLine: rx },
         { city: rx },
         { bundesland: rx },
@@ -332,8 +334,6 @@ export async function registerSellerRoutes(fastify: FastifyInstance, cfg: Config
         companyName: l.companyName,
         summary: l.summary,
         summaryDe: l.summaryDe,
-        gisaNumber: l.gisaNumber,
-        authority: l.authority,
         addressLine: l.addressLine,
         city: l.city,
         bundesland: l.bundesland,

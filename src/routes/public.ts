@@ -12,7 +12,7 @@ import type { ListingDoc } from "../models/Listing.js";
 import type { UserDoc } from "../models/User.js";
 import type { HydratedDocument } from "mongoose";
 
-import { austriaBundeslandEnum } from "../lib/austria-bundeslaender.js";
+import { isValidTradeCategory } from "../lib/trade-categories.js";
 
 /**
  * Sellers whose listing-partner subscription is dormant (trial expired without
@@ -35,12 +35,19 @@ const contactBody = z.object({
   email: z.string().email(),
   phone: z.string().min(4),
   whatsapp: z.string().optional(),
-  tradeCategory: z.string().min(1),
+  tradeCategory: z
+    .string()
+    .trim()
+    .min(1)
+    .refine((v) => isValidTradeCategory(v), { message: "invalid_trade_category" }),
 });
 
 const publicListingsSearchQuery = z.object({
-  /** Required filter: `all` or a federal state (must be sent explicitly). */
-  state: z.union([z.literal("all"), austriaBundeslandEnum]),
+  /** `all` or a canonical trade category value from `trade-categories.ts`. */
+  category: z
+    .string()
+    .optional()
+    .transform((s) => (s ?? "all").trim()),
   q: z
     .string()
     .max(200)
@@ -95,7 +102,7 @@ export async function registerPublicRoutes(fastify: FastifyInstance, cfg: Config
   fastify.get("/public/listings/search", async (request, reply) => {
     const raw = (request.query ?? {}) as Record<string, unknown>;
     const parsed = publicListingsSearchQuery.safeParse({
-      state: firstQueryString(raw.state),
+      category: firstQueryString(raw.category) ?? firstQueryString(raw.state),
       q: firstQueryString(raw.q),
       page: firstQueryString(raw.page),
       limit: firstQueryString(raw.limit),
@@ -104,10 +111,16 @@ export async function registerPublicRoutes(fastify: FastifyInstance, cfg: Config
       return reply.code(400).send({ error: "validation", details: parsed.error.flatten() });
     }
 
-    const { state, q, page, limit } = parsed.data;
+    const { category: categoryRaw, q, page, limit } = parsed.data;
+    const category =
+      categoryRaw === "all" || !categoryRaw
+        ? "all"
+        : isValidTradeCategory(categoryRaw)
+          ? categoryRaw
+          : "all";
     const baseFilter: Record<string, unknown> = { status: "approved", active: true };
-    if (state !== "all") {
-      baseFilter.bundesland = state;
+    if (category !== "all") {
+      baseFilter.tradeCategory = category;
     }
     if (q.length > 0) {
       const rx = new RegExp(escapeRegex(q), "i");
@@ -118,8 +131,6 @@ export async function registerPublicRoutes(fastify: FastifyInstance, cfg: Config
         { companyName: rx },
         { summary: rx },
         { summaryDe: rx },
-        { gisaNumber: rx },
-        { authority: rx },
         { addressLine: rx },
         { city: rx },
         { bundesland: rx },
@@ -167,7 +178,7 @@ export async function registerPublicRoutes(fastify: FastifyInstance, cfg: Config
   /**
    * Public detail view — exposes the verified license metadata that mirrors what users
    * already see in the search results plus the structured fields rendered on the
-   * detail page (GISA, authority, address summary, status). Sensitive contact
+   * detail page (address summary, status). Sensitive contact
    * details remain behind the buyer workspace unlock flow.
    */
   fastify.get<{ Params: { slug: string } }>("/public/listings/by-slug/:slug", async (request, reply) => {
@@ -187,8 +198,6 @@ export async function registerPublicRoutes(fastify: FastifyInstance, cfg: Config
       companyName: listing.companyName ?? null,
       summary: listing.summary ?? null,
       summaryDe: listing.summaryDe ?? null,
-      gisaNumber: listing.gisaNumber ?? null,
-      authority: listing.authority ?? null,
       addressLine: listing.addressLine ?? null,
       city: listing.city ?? null,
       bundesland: listing.bundesland ?? null,

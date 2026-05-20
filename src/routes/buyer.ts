@@ -21,7 +21,7 @@ import {
 import { UnlockEventModel } from "../models/UnlockEvent.js";
 import { formatInquiryAddressLine } from "../lib/inquiry-address.js";
 import { normalizeLicenseImageUrlForBrowser } from "../lib/minio-license.js";
-import { AUSTRIA_BUNDESLAENDER } from "../lib/austria-bundeslaender.js";
+import { isValidTradeCategory } from "../lib/trade-categories.js";
 
 const creditsCheckoutBody = z.object({
   credits: z.number().int().min(1).max(500),
@@ -49,22 +49,25 @@ function firstQueryString(v: unknown): string | undefined {
 
 /**
  * Builds the Mongo filter for the buyer-directory teaser list. Mirrors the
- * landing page's `/public/listings/search` semantics: `state` narrows by
- * Bundesland, `q` does case-insensitive substring search across the listing's
+ * landing page's `/public/listings/search` semantics: `category` narrows by
+ * trade category, `q` does case-insensitive substring search across the listing's
  * public-safe fields. Locked teasers still get scrubbed by `listingToTeaser`.
  */
 function buildDirectoryListingFilter(
   qs: Record<string, unknown>
-): { filter: Record<string, unknown>; q: string; state: string } {
+): { filter: Record<string, unknown>; q: string; category: string } {
   const filter: Record<string, unknown> = { status: "approved", active: true };
 
-  const stateRaw = firstQueryString(qs.state) ?? "all";
-  const state =
-    stateRaw === "all" || (AUSTRIA_BUNDESLAENDER as readonly string[]).includes(stateRaw)
-      ? stateRaw
-      : "all";
-  if (state !== "all") {
-    filter.bundesland = state;
+  const categoryRaw =
+    firstQueryString(qs.category) ?? firstQueryString(qs.state) ?? "all";
+  const category =
+    categoryRaw === "all" || !categoryRaw
+      ? "all"
+      : isValidTradeCategory(categoryRaw)
+        ? categoryRaw
+        : "all";
+  if (category !== "all") {
+    filter.tradeCategory = category;
   }
 
   const qRaw = firstQueryString(qs.q) ?? "";
@@ -78,15 +81,13 @@ function buildDirectoryListingFilter(
       { companyName: rx },
       { summary: rx },
       { summaryDe: rx },
-      { gisaNumber: rx },
-      { authority: rx },
       { addressLine: rx },
       { city: rx },
       { bundesland: rx },
     ];
   }
 
-  return { filter, q, state };
+  return { filter, q, category };
 }
 
 /**
@@ -125,7 +126,7 @@ const inquiryBody = z.object({
 
 /**
  * Locked teasers expose only public-safe identity (display label, slug, trade
- * category). Sensitive fields — company name, summary, GISA, authority, full
+ * category). Sensitive fields — company name, summary, full
  * address, city, bundesland — are withheld until the buyer unlocks this
  * specific listing.
  */
@@ -139,8 +140,6 @@ function listingToTeaser(
     companyName?: string | null;
     summary?: string | null;
     summaryDe?: string | null;
-    gisaNumber?: string | null;
-    authority?: string | null;
     addressLine?: string | null;
     city?: string | null;
     bundesland?: string | null;
@@ -175,8 +174,6 @@ function listingToTeaser(
     companyName: l.companyName ?? null,
     summary: l.summary ?? null,
     summaryDe: l.summaryDe ?? null,
-    gisaNumber: l.gisaNumber ?? null,
-    authority: l.authority ?? null,
     addressLine: l.addressLine ?? null,
     city: l.city ?? null,
     bundesland: l.bundesland ?? null,
@@ -225,12 +222,12 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
     const inquiryPL = parsePageLimitQuery(qs, { prefix: "inquiry", defaultLimit: 20, maxLimit: 100 });
 
     /**
-     * Teaser query honors keyword (`q`) + state (`bundesland`) filters so the
+     * Teaser query honors keyword (`q`) + trade category filters so the
      * buyer directory mirrors the public landing search experience. The label
      * lookup keeps the unfiltered set so cross-references (e.g. inquiry rows)
      * still resolve when the directory is filtered down.
      */
-    const { filter: listingFilter, q: teaserQ, state: teaserState } =
+    const { filter: listingFilter, q: teaserQ, category: teaserCategory } =
       buildDirectoryListingFilter(qs);
     const labelFilter = { status: "approved" as const, active: true };
 
@@ -405,8 +402,7 @@ export async function registerBuyerRoutes(fastify: FastifyInstance, cfg: Config)
       teaserLimit: teaserPL.limit,
       teaserTotalPages: totalPages(teaserTotal, teaserPL.limit),
       teaserQ,
-      teaserState,
-      teaserBundeslaender: [...AUSTRIA_BUNDESLAENDER],
+      teaserCategory,
       invoices: invoicesOut,
       invoicesTotal,
       invoicesPage: invoicePL.page,

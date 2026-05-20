@@ -9,8 +9,6 @@ const listingSchema = new Schema(
     companyName: { type: String, trim: true },
     summary: { type: String, trim: true },
     summaryDe: { type: String, trim: true },
-    gisaNumber: { type: String, trim: true },
-    authority: { type: String, trim: true },
     addressLine: { type: String, trim: true },
     city: { type: String, trim: true },
     bundesland: { type: String, trim: true },
